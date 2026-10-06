@@ -645,6 +645,26 @@ class OffloadingConnectorScheduler:
                   (between scheduler steps).
         """
         req_status = self._req_status[request.request_id]
+
+        # A load can only be issued when no other job is pending (see the
+        # assert in update_state_after_alloc), but a store may legitimately be
+        # in flight while the lookup finds blocks in the external tier. Defer
+        # the lookup until the set drains instead of queueing a load that would
+        # trip the assert. Upstream PR #46231; the request is retried on a
+        # later scheduling step.
+        #
+        # The deferral sits before the state below is written on purpose. A
+        # delayed request must go back to the scheduler exactly as it was:
+        # clearing block_ids or skipping update_offload_keys() here would pair
+        # a stale num_locally_computed_tokens with rebuilt blocks and trip the
+        # bound assert in update_state_after_alloc on the retry.
+        if req_status.transfer_jobs:
+            logger.debug(
+                "Delaying request %s since it still has in-flight transfers",
+                request.request_id,
+            )
+            return None, False
+
         for group_state in req_status.group_states:
             group_state.block_ids.clear()
 
