@@ -224,6 +224,10 @@ class SpecDecodeBaseProposer:
 
         self.device = device
         self.dtype = vllm_config.model_config.dtype
+        # Optional MTP + prompt-ngram assist (this fork); see
+        # vllm/v1/spec_decode/mtp_ngram_assist.py.
+        self._mtp_ngram_runner = runner
+        self._mtp_ngram_assist = self._init_mtp_ngram_assist()
         self.max_model_len = vllm_config.model_config.max_model_len
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
@@ -460,6 +464,67 @@ class SpecDecodeBaseProposer:
             rocm_types.append(FlexAttentionMetadata)
 
             self.allowed_attn_types = tuple(rocm_types)
+
+    def _init_mtp_ngram_assist(self):
+        """Build the optional MTP ngram assist, or return None.
+
+        Gated by the speculative-config flag (ngram_assist +
+        prompt_lookup_min/max); config/speculative.py is patched to
+        allow it with method='mtp' (see patch-mtp-ngram-assist.sh).
+        """
+        try:
+            sc = self.speculative_config
+            if not getattr(sc, "ngram_assist", False):
+                return None
+            if self.method != "mtp":
+                return None
+            from vllm.v1.spec_decode.mtp_ngram_assist import (
+                MtpNgramAssist,
+            )
+
+            return MtpNgramAssist(self.vllm_config)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("MTP ngram assist disabled: %s", e)
+            return None
+
+    def _apply_mtp_ngram_overlay(self, draft_token_ids, batch_size):
+        """Overlay verbatim-history ngram runs onto the MTP draft."""
+        assist = self._mtp_ngram_assist
+        if assist is None:
+            return draft_token_ids
+        runner = self._mtp_ngram_runner
+        if runner is None:
+            return draft_token_ids
+        input_batch = getattr(runner, "input_batch", None)
+        if input_batch is None:
+            return draft_token_ids
+        token_ids_cpu = getattr(input_batch, "token_ids_cpu", None)
+        num_tokens_no_spec = getattr(input_batch, "num_tokens_no_spec", None)
+        if token_ids_cpu is None or num_tokens_no_spec is None:
+            return draft_token_ids
+        try:
+            overlay_tokens, overlay_full = assist.propose(
+                token_ids_cpu[:batch_size], num_tokens_no_spec[:batch_size]
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("MTP ngram overlay skipped: %s", e)
+            return draft_token_ids
+        if not overlay_full.any():
+            return draft_token_ids
+        draft = draft_token_ids
+        if draft.shape[0] < batch_size:
+            return draft
+        rows = np.nonzero(overlay_full)[0]
+        if rows.size:
+            # .to(draft.dtype) alone leaves this on the CPU -- torch.from_numpy
+            # always builds a CPU tensor -- and indexing a CUDA draft with a CPU
+            # source raises 'Expected all tensors to be on the same device'.
+            # Measured 2026-09-28 19:39: an ngram-eligible prompt killed the
+            # engine with that RuntimeError and a 500 for the client.
+            draft[rows] = torch.from_numpy(overlay_tokens[rows]).to(
+                device=draft.device, dtype=draft.dtype
+            )
+        return draft
 
     def _get_hidden_size(self) -> int:
         """Return the hidden width consumed by the draft model."""
@@ -1572,6 +1637,7 @@ class SpecDecodeBaseProposer:
         self._sm70_mtp_profile_report(
             profile_events, profile_cpu_ms, batch_size, num_tokens
         )
+        draft_token_ids = self._apply_mtp_ngram_overlay(draft_token_ids, batch_size)
         if isinstance(self._static_draft_vocab, DynamicDraftVocabRuntime):
             self._static_draft_vocab.end_proposal()
         return draft_token_ids
