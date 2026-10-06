@@ -162,6 +162,13 @@ class SchedulerConfig:
     checking the first chunk. Prevents over-admission and KV cache thrashing
     with chunked prefill."""
 
+    watermark: float = Field(default=0.0, ge=0.0, lt=1.0)
+    """Fraction of total KV cache blocks to keep free (the watermark) when
+    admitting waiting or preempted requests into the running queue. This
+    headroom keeps the pool from being driven past (1 - watermark) by a new
+    admission, avoiding the eviction/preemption churn that collapses decode
+    throughput near the pool ceiling. 0.0 (the default) disables it."""
+
     async_scheduling: bool | None = None
     """If set to False, disable async scheduling. Async scheduling helps to
     avoid gaps in GPU utilization, leading to better latency and throughput.
