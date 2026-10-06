@@ -1423,12 +1423,23 @@ class SpeculativeConfig:
                 f"than zero ({self.num_speculative_tokens})."
             )
         if self.ngram_assist:
-            if not self.use_dflash():
-                raise ValueError("ngram_assist is only supported with method='dflash'.")
-            draft_hf_config = getattr(self.draft_model_config, "hf_config", None)
-            dflash_config = getattr(draft_hf_config, "dflash_config", None) or {}
-            if int(dflash_config.get("selector_top_k", 0) or 0) <= 0:
-                raise ValueError("ngram_assist requires DFlash2 selector capability.")
+            # SM70 prompt-ngram assist patch: allow method='mtp'. MTP has
+            # no dflash selector to validate, and the ngram window comes
+            # from prompt_lookup_min/max in --speculative-config.
+            if not (
+                self.use_dflash() or self.method == "mtp"
+            ):  # SM70 prompt-ngram assist patch
+                raise ValueError(
+                    "ngram_assist is only supported with method='dflash'"
+                    " (or 'mtp' with the SM70 prompt-ngram assist patch)."
+                )
+            if self.use_dflash():
+                draft_hf_config = getattr(self.draft_model_config, "hf_config", None)
+                dflash_config = getattr(draft_hf_config, "dflash_config", None) or {}
+                if int(dflash_config.get("selector_top_k", 0) or 0) <= 0:
+                    raise ValueError(
+                        "ngram_assist requires DFlash2 selector capability."
+                    )
         if self.use_dflash_ddtree():
             if self.ddtree_budget is None:
                 self.ddtree_budget = self.num_speculative_tokens
