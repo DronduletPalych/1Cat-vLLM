@@ -18,6 +18,8 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
 import functools
 import json
 import os
+import re
+import shutil
 import threading
 from collections import OrderedDict
 from collections.abc import Collection, Iterable
@@ -91,6 +93,8 @@ class FileSystemTierManager(SecondaryTierManager):
             gpu_blocks_per_file=offloading_spec.block_size_factor,
         )
 
+        self._cleanup_stale_layouts(root_dir)
+
         # Write config file
         config_path = self.file_mapper.get_config_file_path()
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
@@ -129,6 +133,41 @@ class FileSystemTierManager(SecondaryTierManager):
         self, key: OffloadKey, req_context: ReqContext | None = None
     ) -> bool | None:
         return os.path.exists(self.file_mapper.get_file_name(key))
+
+    def _cleanup_stale_layouts(self, root_dir: str) -> None:
+        """Remove tier layouts left behind by an earlier cache geometry.
+
+        FileMapper derives its directory from a hash of the cache geometry, so
+        the engine moves to a new one whenever that geometry changes and the
+        old one is never referenced again. The tier's own accounting cannot
+        reach it -- _block_roots() scans inside the current base, not the
+        parent -- so a dead layout counts against the disk but not against
+        max_bytes, and accumulates without bound.
+
+        Only entries belonging to this model are considered, and only the
+        current base and its per-rank block directory are kept. Anything else
+        under root_dir is left as it is.
+        """
+        base = os.path.basename(self.file_mapper.base_path)
+        safe_model = base.rsplit("_", 1)[0]
+        rank = getattr(self.file_mapper, "rank", 0)
+        keep = {base, f"{base}_r{rank}"}
+        # Names are <safe_model>_<12 hex> and <safe_model>_<12 hex>_r<rank>.
+        # Matching the digest rather than a bare prefix keeps a model whose
+        # name extends this one's (X next to X_Y) out of the deletion set.
+        stale = re.compile(rf"^{re.escape(safe_model)}_[0-9a-f]{{12}}(?:_r[0-9]+)?$")
+        try:
+            entries = os.listdir(root_dir)
+        except OSError:
+            return
+        for name in entries:
+            if name in keep or not stale.match(name):
+                continue
+            path = os.path.join(root_dir, name)
+            if not os.path.isdir(path):
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+            logger.info("Filesystem KV tier: removed stale layout %s", name)
 
     def _block_roots(self) -> list[str]:
         """Directories that actually hold block files.
