@@ -630,6 +630,18 @@ class Worker(WorkerBase):
             - self.init_snapshot.torch_memory
             - profile_result.weights_memory,
         )
+        # Charged only when asked for. Upstream #518 added this term for a
+        # cold-compile case that does not occur on Volta; on this host it was
+        # the 0.99 GiB that put the KV pool below what max-model-len needs.
+        # The value is still computed and logged either way.
+        if os.getenv("VLLM_WARMUP_RESIDUAL_CHARGE", "0") != "1":
+            logger.info_once(
+                "Not charging warm-up residual (%s GiB) to the KV budget; "
+                "set VLLM_WARMUP_RESIDUAL_CHARGE=1 to restore upstream "
+                "behaviour.",
+                format_gib(warmup_torch_residual),
+            )
+            warmup_torch_residual = 0
         profile_result.non_kv_cache_memory = (
             profile_result.non_torch_increase
             + profile_result.torch_peak_increase
