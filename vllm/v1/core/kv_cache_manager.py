@@ -6,27 +6,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
-import vllm.envs as envs
-from vllm.config.cache import KVRetentionConfig
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
-from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import BlockHashListWithBlockSize, KVCacheBlock
-from vllm.v1.core.partial_prefix_cache import (
-    PartialEntry,
-    PartialKey,
-    PartialPrefixCache,
-    tail_mm_items,
-)
-from vllm.v1.core.single_type_kv_cache_manager import (
-    CircularBufferManager,
-    FullAttentionManager,
-    MambaManager,
-    SlidingWindowManager,
-)
+from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -36,37 +21,9 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_sliding_window,
 )
 from vllm.v1.metrics.stats import PrefixCacheStats
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
-
-
-class KVPartialHitDriftError(Exception):
-    """A partial-prefix hit no longer matches the entry it was redirected on.
-
-    `_redirect_partial_hit` verified that the request's blocks still ended with
-    the entry's blocks. Eviction (`_reclaim_partial_blocks`) has no in-flight
-    protection and frees the entry's blocks back to the pool for reuse, so the
-    tail block can change under a request between the hit and the redirect.
-    The check used to be an assert, which killed EngineCore for the whole
-    process. Raising this instead lets the scheduler drop the stale hit and
-    recompute the request from scratch: only the request is affected.
-    """
-
-    def __init__(self, request: Request, entry: PartialEntry):
-        self.request = request
-        self.entry = entry
-        self.key = entry.key
-        super().__init__(f"partial hit drift: req={request.request_id} key={entry.key}")
-
-
-_V41_SESSION_PREFIX = envs.VLLM_V41_SESSION_PREFIX == "1"
-# VLLM_V41_BATCH with paged window caches: every request's window rows sit in
-# its own (cached) blocks, so any even hit is valid, not only a continuation
-# of the last executed sequence (whose ring the single-request path keeps).
-_V41_PAGED_PREFIX = envs.VLLM_V41_BATCH == "1" and envs.VLLM_V41_WINDOW_RING == "0"
-# Available rewind behind the last committed token, before rejected drafts.
-_V41_RING_REACH = 128
 
 
 @dataclass
@@ -163,20 +120,19 @@ class KVCacheManager:
         max_in_flight_tokens: int | None = None,
         enable_caching: bool = True,
         use_eagle: bool = False,
-        use_lookahead_block_hashes: bool = False,
         log_stats: bool = False,
         enable_kv_cache_events: bool = False,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
         prefix_cache_retention_interval: int | None = None,
-        partial_prefix_cache: bool = False,
-        num_speculative_tokens: int = 0,
-        retention_policy: KVRetentionConfig | None = None,
-        enable_decode_ckpt: bool = False,
+        watermark: float = 0.0,
     ) -> None:
         self.max_model_len = max_model_len
-        self.num_speculative_tokens = num_speculative_tokens
+        # Watermark: minimum number of KV cache blocks to keep free when
+        # admitting waiting/preempted requests. 0.0 disables it.
+        assert watermark >= 0.0, "watermark must be non-negative"
+        self.watermark_blocks = int(watermark * kv_cache_config.num_blocks)
         # When unset, fall back to `max_model_len` so the recycling-aware cap
         # collapses to the prior (uncapped) admission behavior. The scheduler
         # always supplies the real value at runtime.
@@ -203,46 +159,13 @@ class KVCacheManager:
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
-            use_lookahead_block_hashes=use_lookahead_block_hashes,
-            retention_policy=retention_policy,
         )
         self.coordinator.configure_prefix_cache_retention(
             prefix_cache_retention_interval
         )
-        if _V41_SESSION_PREFIX and _V41_PAGED_PREFIX:
-            # Multi-turn sessions resume after the reply, not only the prompt.
-            for manager in self.coordinator.single_type_managers:
-                manager.hold_reply_window = True
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
-        self._step = 0
-        self._block_copies: list[tuple[int, int]] = []
-        self._block_copy_groups: list[int] = []
-        self._copy_origin_this_step: dict[int, int] = {}
-        # (release step, blocks): copy endpoints kept until the copy has run.
-        self._deferred_release: list[tuple[int, list[KVCacheBlock]]] = []
-        # (request, boundary, num_preemptions) whose step ends at a boundary.
-        self._pending_snapshots: list[tuple[Request, int, int]] = []
-        self.enable_decode_ckpt = enable_decode_ckpt
-        self._enable_decode_ckpt = False
-        self._mamba_group_ids: tuple[int, ...] = ()
-        self._decode_ckpt_blocks: dict[
-            str, tuple[int, dict[int, tuple[KVCacheBlock, KVCacheBlock]]]
-        ] = {}
-        self._pending_decode_ckpt_mounts: list[tuple[str, list[int], list[int]]] = []
-        self._pending_decode_snapshots: list[
-            tuple[
-                PartialKey,
-                int,
-                dict[int, KVCacheBlock],
-                dict[int, list[KVCacheBlock]],
-                list[KVCacheBlock],
-            ]
-        ] = []
-        self.partial_cache: PartialPrefixCache | None = None
-        if partial_prefix_cache and enable_caching:
-            self._init_partial_prefix_cache(hash_block_size)
         self.kv_cache_event_metadata = tuple(
             (
                 get_kv_cache_spec_kind(group.kv_cache_spec).value,
@@ -281,651 +204,6 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
 
-    # V4.1 window rings hold only the last executed sequence's recent rows.
-    _v41_last: tuple[list[int], int] | None = None
-
-    def _v41_session_hit(self, request: Request, hit: int) -> bool:
-        if _V41_PAGED_PREFIX:
-            return hit % 2 == 0
-        last = self._v41_last
-        if last is None or hit % 2:
-            return False
-        tokens, processed = last
-        # Rejected drafts after the committed token may have overwritten
-        # older window slots. Reserve their actual configured lookahead.
-        reach = max(0, _V41_RING_REACH - max(0, self.num_speculative_tokens - 1))
-        if not processed - reach <= hit <= processed:
-            return False
-        return list(request.all_token_ids)[:hit] == tokens[:hit]
-
-    def _init_partial_prefix_cache(self, hash_block_size: int) -> None:
-        managers = self.coordinator.single_type_managers
-        supported = any(isinstance(m, MambaManager) for m in managers) and all(
-            type(m)
-            in (
-                FullAttentionManager,
-                SlidingWindowManager,
-                CircularBufferManager,
-            )
-            or (isinstance(m, MambaManager) and m.mamba_cache_mode == "align")
-            for m in managers
-        )
-        if not supported:
-            logger.warning(
-                "Partial prefix cache supports full-attention, sliding-window, "
-                "circular-buffer and aligned Mamba groups; keeping block-aligned "
-                "hits (groups: %s).",
-                [type(m).__name__ for m in managers],
-            )
-            return
-        self.hash_block_size = hash_block_size
-        # Entries are keyed under the last block boundary shared by all groups.
-        self.partial_block_size = max(m.block_size for m in managers)
-        if any(self.partial_block_size % m.block_size for m in managers):
-            logger.warning("Partial prefix cache needs nested block sizes.")
-            return
-        state_blocks = getattr(self.block_pool, "_device_state_blocks", 0) or 0
-        if state_blocks > 0:
-            mamba_groups = max(
-                1, sum(1 for m in managers if isinstance(m, MambaManager))
-            )
-            max_state_entries = max(2, state_blocks * 2 // (5 * mamba_groups))
-            max_partial_blocks = min(
-                self.block_pool.num_gpu_blocks * 2 // 5,
-                max_state_entries * len(managers),
-            )
-        else:
-            max_partial_blocks = self.block_pool.num_gpu_blocks * 2 // 5
-        self.partial_cache = PartialPrefixCache(
-            block_pool=self.block_pool,
-            # Leave pool headroom for active requests and full-block prefix
-            # parents while retaining active multi-turn agent snapshots.
-            max_blocks=max(4 * len(managers), max_partial_blocks),
-        )
-        self._mamba_group_ids = tuple(
-            i for i, m in enumerate(managers) if isinstance(m, MambaManager)
-        )
-        self._enable_decode_ckpt = bool(
-            self.enable_decode_ckpt
-            and self._mamba_group_ids
-            and self.partial_block_size >= 128
-            and self.partial_block_size % 64 == 0
-        )
-        logger.info(
-            "Partial prefix cache enabled: %d-token boundary blocks, %d groups, "
-            "up to %d entry blocks.",
-            self.partial_block_size,
-            len(managers),
-            self.partial_cache.max_blocks,
-        )
-
-    def _partial_parent(self, request: Request, boundary: int):
-        """(parent hash, start of the tail) for a boundary."""
-        block_start = boundary // self.partial_block_size * self.partial_block_size
-        index = block_start // self.hash_block_size - 1
-        return (request.block_hashes[index] if index >= 0 else None), block_start
-
-    def _partial_key(self, request: Request, boundary: int):
-        parent, block_start = self._partial_parent(request, boundary)
-        lora_id = request.lora_request.lora_int_id if request.lora_request else 0
-        return (
-            parent,
-            tuple(request.all_token_ids[block_start:boundary]),
-            request.cache_salt,
-            lora_id,
-            tail_mm_items(request.mm_features, block_start, boundary),
-        )
-
-    def _partial_block_range(self, manager, boundary: int) -> tuple[int, int]:
-        """Block indices ``[first, last]`` an entry keeps for one group."""
-        if isinstance(manager, CircularBufferManager):
-            return 0, 0
-        block_size = manager.block_size
-        last = (boundary - 1) // block_size
-        if isinstance(manager, SlidingWindowManager):
-            first = max(0, boundary - (manager.sliding_window - 1)) // block_size
-            return min(first, last), last
-        return last, last
-
-    def partial_prefix_stops(
-        self, request: Request, start: int, end: int
-    ) -> tuple[int, ...]:
-        """Boundaries inside ``(start, end)`` whose state must be kept."""
-        if self.partial_cache is None or not request.prefix_cache_boundaries:
-            return ()
-        hashed = len(request.block_hashes) * self.hash_block_size
-        coalesce_gen_tail = (
-            start > 0
-            and self._enable_decode_ckpt
-            and end == request.num_prompt_tokens
-            and (request.max_tokens or 0) >= 64
-        )
-        return tuple(
-            b
-            for b in request.prefix_cache_boundaries
-            if start < b < end
-            and b % self.partial_block_size
-            and not (coalesce_gen_tail and end - b < 80)
-            and b // self.partial_block_size * self.partial_block_size <= hashed
-            and not self.partial_cache.contains(self._partial_key(request, b))
-        )
-
-    def _partial_prefix_hit(
-        self, request: Request, hit_length: int, max_length: int
-    ) -> tuple[tuple[list[KVCacheBlock], ...], int] | None:
-        cache = self.partial_cache
-        if cache is None or not cache.entries:
-            return None
-        hashes = request.block_hashes
-        lora_id = request.lora_request.lora_int_id if request.lora_request else 0
-        tokens = request.all_token_ids
-        ratio = self.partial_block_size // self.hash_block_size
-        entry = None
-        for num_blocks in range(
-            min(len(hashes) // ratio, max_length // self.partial_block_size),
-            hit_length // self.partial_block_size - 1,
-            -1,
-        ):
-            parent = hashes[num_blocks * ratio - 1] if num_blocks else None
-            if parent not in cache.by_parent:
-                continue
-            entry = cache.lookup(
-                parent,
-                tokens,
-                num_blocks * self.partial_block_size,
-                max_length,
-                request.cache_salt,
-                lora_id,
-                self._step,
-                request.mm_features,
-            )
-            if entry is not None and entry.length > hit_length:
-                break
-            entry = None
-        if entry is None:
-            return None
-        boundary = entry.length
-        blocks: list[list[KVCacheBlock]] = []
-        for group_id, manager in enumerate(self.coordinator.single_type_managers):
-            first, _ = self._partial_block_range(manager, boundary)
-            if isinstance(manager, CircularBufferManager):
-                blocks.append(list(entry.blocks[group_id]))
-            elif isinstance(manager, FullAttentionManager):
-                group_hashes = (
-                    hashes
-                    if manager.block_size == self.hash_block_size
-                    else BlockHashListWithBlockSize(
-                        hashes, self.hash_block_size, manager.block_size
-                    )
-                )
-                full = []
-                for i in range(first):
-                    cached = self.block_pool.get_cached_block(
-                        group_hashes[i], [group_id]
-                    )
-                    if cached is None:
-                        return None
-                    full.append(cached[0])
-                blocks.append(full + entry.blocks[group_id])
-            else:
-                blocks.append(
-                    [self.block_pool.null_block] * first + entry.blocks[group_id]
-                )
-        demand = {group_id: 1 for group_id, copy in enumerate(entry.copy_last) if copy}
-        while (
-            not self._can_allocate(demand)
-            and len(cache.entries) > 1
-            and cache.evict_one(protected=entry)
-        ):
-            pass
-        if not self._can_allocate(demand):
-            return None
-        request.partial_prefix_entry = entry
-        return tuple(blocks), boundary
-
-    def _can_allocate(self, demand: dict[int, int]) -> bool:
-        # Partition quotas alone pass whenever the pool is not partitioned;
-        # an empty pool must skip optional copies, not raise (#1483).
-        num_blocks = sum(demand.values())
-        return num_blocks <= self.block_pool.get_num_free_blocks() and (
-            self.block_pool.can_allocate_group_blocks(demand)
-        )
-
-    def _defer_release(self, blocks: list[KVCacheBlock]) -> None:
-        # Async scheduling runs up to two steps ahead of the worker; the copy
-        # emitted in this step has executed once three more steps started.
-        self._deferred_release.append((self._step + 3, blocks))
-
-    def _redirect_partial_hit(self, request: Request, entry: PartialEntry) -> None:
-        """Copy-on-write: continue the request on private copies."""
-        # Verify every group before writing anything: a drift found halfway
-        # through the loop would otherwise leave a half-updated request. On a
-        # mismatch the scheduler drops the hit and recomputes the request.
-        req_blocks_by_group: list[list[KVCacheBlock]] = []
-        for group_id, manager in enumerate(self.coordinator.single_type_managers):
-            req_blocks = manager.req_to_blocks.get(request.request_id)
-            if not req_blocks or req_blocks[-1] is not entry.blocks[group_id][-1]:
-                raise KVPartialHitDriftError(request, entry)
-            req_blocks_by_group.append(req_blocks)
-
-        sources = []
-        for group_id, manager in enumerate(self.coordinator.single_type_managers):
-            req_blocks = req_blocks_by_group[group_id]
-            last = len(req_blocks) - 1
-            # Blocks before the last one are full and only read.
-            manager.num_cached_block[request.request_id] = (
-                last if entry.copy_last[group_id] else last + 1
-            )
-            if not entry.copy_last[group_id]:
-                continue
-            source = req_blocks[last]
-            target = self.block_pool.get_new_blocks(1, group_id)[0]
-            req_blocks[last] = target
-            src_id = self._copy_origin_this_step.get(source.block_id, source.block_id)
-            self._block_copies.append((src_id, target.block_id))
-            self._block_copy_groups.append(group_id)
-            sources.append(source)
-        # Keep the reference taken by the cache hit until the copy has run.
-        if sources:
-            self._defer_release(sources)
-
-    def _materialize_snapshots(self) -> None:
-        cache = self.partial_cache
-        assert cache is not None
-        pending, self._pending_snapshots = self._pending_snapshots, []
-        managers = self.coordinator.single_type_managers
-        for request, boundary, num_preemptions in pending:
-            if request.num_preemptions != num_preemptions or request.is_finished():
-                continue
-            key = self._partial_key(request, boundary)
-            if cache.contains(key):
-                continue
-            sources: list[list[KVCacheBlock]] = []
-            pinned_parents: list[KVCacheBlock] = []
-            seen_parent_ids: set[int] = set()
-            for group_id, manager in enumerate(managers):
-                req_blocks = manager.req_to_blocks.get(request.request_id)
-                first, last = self._partial_block_range(manager, boundary)
-                if not req_blocks or len(req_blocks) <= last:
-                    break
-                group_sources = req_blocks[first : last + 1]
-                if any(block.is_null for block in group_sources):
-                    break
-                if first > 0 and isinstance(manager, FullAttentionManager):
-                    parents = req_blocks[:first]
-                    group_hashes = (
-                        request.block_hashes
-                        if manager.block_size == self.hash_block_size
-                        else BlockHashListWithBlockSize(
-                            request.block_hashes,
-                            self.hash_block_size,
-                            manager.block_size,
-                        )
-                    )
-                    if (
-                        len(group_hashes) < first
-                        or any(block.is_null for block in parents)
-                        or any(
-                            self.block_pool.get_cached_block(
-                                group_hashes[i], [group_id]
-                            )
-                            is None
-                            for i in range(first)
-                        )
-                    ):
-                        break
-                    for p_blk in parents:
-                        if p_blk.block_id not in seen_parent_ids:
-                            seen_parent_ids.add(p_blk.block_id)
-                            pinned_parents.append(p_blk)
-                sources.append(group_sources)
-            if len(sources) != len(managers):
-                continue
-            demand = {g: len(blocks) for g, blocks in enumerate(sources)}
-            while not self._can_allocate(demand):
-                if not cache.evict_one():
-                    break
-            if not self._can_allocate(demand):
-                continue
-            targets: list[list[KVCacheBlock]] = []
-            for group_id, group_sources in enumerate(sources):
-                group_targets = self.block_pool.get_new_blocks(
-                    len(group_sources), group_id
-                )
-                for source, target in zip(group_sources, group_targets):
-                    self._block_copies.append((source.block_id, target.block_id))
-                    self._block_copy_groups.append(group_id)
-                    self._copy_origin_this_step[target.block_id] = source.block_id
-                targets.append(group_targets)
-            flat = [block for blocks in sources for block in blocks]
-            # The request may release these blocks this step.
-            self.block_pool.touch(flat)
-            self._defer_release(flat)
-            if pinned_parents:
-                self.block_pool.touch(pinned_parents)
-            copy_last = [
-                isinstance(m, CircularBufferManager) or boundary % m.block_size != 0
-                for m in managers
-            ]
-            cache.insert(
-                PartialEntry(
-                    key=key,
-                    length=boundary,
-                    blocks=targets,
-                    copy_last=copy_last,
-                    ready_step=self._step - 1 if all(copy_last) else self._step,
-                    pinned_blocks=pinned_parents,
-                )
-            )
-
-    def _materialize_decode_snapshots(self) -> None:
-        cache = self.partial_cache
-        assert cache is not None
-        pending, self._pending_decode_snapshots = self._pending_decode_snapshots, []
-        managers = self.coordinator.single_type_managers
-        for (
-            key,
-            boundary,
-            chosen_mamba,
-            non_mamba_sources,
-            pinned_parents,
-        ) in pending:
-            if cache.contains(key):
-                self._defer_release(list(chosen_mamba.values()))
-                if pinned_parents:
-                    self.block_pool.free_blocks(pinned_parents)
-                continue
-            demand = {gid: len(blks) for gid, blks in non_mamba_sources.items()}
-            while not self._can_allocate(demand):
-                if not cache.evict_one():
-                    break
-            if not self._can_allocate(demand):
-                self._defer_release(list(chosen_mamba.values()))
-                if pinned_parents:
-                    self.block_pool.free_blocks(pinned_parents)
-                continue
-            targets: list[list[KVCacheBlock]] = []
-            for group_id in range(len(managers)):
-                if group_id in chosen_mamba:
-                    targets.append([chosen_mamba[group_id]])
-                    continue
-                group_sources = non_mamba_sources[group_id]
-                group_targets = self.block_pool.get_new_blocks(
-                    len(group_sources), group_id
-                )
-                for source, target in zip(group_sources, group_targets):
-                    self._block_copies.append((source.block_id, target.block_id))
-                    self._block_copy_groups.append(group_id)
-                    self._copy_origin_this_step[target.block_id] = source.block_id
-                targets.append(group_targets)
-            copy_last = [
-                isinstance(m, CircularBufferManager) or boundary % m.block_size != 0
-                for m in managers
-            ]
-            cache.insert(
-                PartialEntry(
-                    key=key,
-                    length=boundary,
-                    blocks=targets,
-                    copy_last=copy_last,
-                    ready_step=self._step - 1 if all(copy_last) else self._step,
-                    pinned_blocks=pinned_parents,
-                )
-            )
-
-    def _maybe_mount_decode_ckpt(self, request: Request, mounted_at: int) -> None:
-        demand = {gid: 2 for gid in self._mamba_group_ids}
-        headroom = min(8, max(2, self.block_pool.num_gpu_blocks // 16))
-        reserve = sum(demand.values()) + headroom
-        if self.block_pool.get_num_free_blocks() < reserve or not self._can_allocate(
-            demand
-        ):
-            cache = self.partial_cache
-            while (
-                cache is not None
-                and len(cache.entries) > 4
-                and (
-                    self.block_pool.get_num_free_blocks() < reserve
-                    or not self._can_allocate(demand)
-                )
-                and cache.evict_one()
-            ):
-                pass
-        if self.block_pool.get_num_free_blocks() < reserve or not self._can_allocate(
-            demand
-        ):
-            return
-        managers = self.coordinator.single_type_managers
-        ckpt_map: dict[int, tuple[KVCacheBlock, KVCacheBlock]] = {}
-        even_ids: list[int] = []
-        odd_ids: list[int] = []
-        for gid in self._mamba_group_ids:
-            even_blk, odd_blk = self.block_pool.get_new_blocks(2, gid)
-            ckpt_map[gid] = (even_blk, odd_blk)
-            even_ids.append(even_blk.block_id)
-            odd_ids.append(odd_blk.block_id)
-            if getattr(managers[gid].kv_cache_spec, "mamba_type", None) in (
-                MambaAttentionBackendEnum.SHORT_CONV,
-                "short_conv",
-            ):
-                managers[gid].new_block_ids.extend(
-                    (even_blk.block_id, odd_blk.block_id)
-                )
-        self._decode_ckpt_blocks[request.request_id] = (mounted_at, ckpt_map)
-        self._pending_decode_ckpt_mounts.append((request.request_id, even_ids, odd_ids))
-
-    def _retire_decode_ckpt(
-        self,
-        request: Request,
-        ckpt_entry: tuple[int, dict[int, tuple[KVCacheBlock, KVCacheBlock]]],
-        valid_len: int,
-    ) -> None:
-        mounted_at, ckpt_map = ckpt_entry
-        cache = self.partial_cache
-        boundary = (valid_len // 64) * 64
-        hashed = (
-            len(request.block_hashes) * self.hash_block_size if cache is not None else 0
-        )
-        can_promote = (
-            cache is not None
-            and request.is_finished()
-            and not request.skip_reading_prefix_cache
-            and boundary > mounted_at
-            and boundary % self.partial_block_size != 0
-            and request.num_in_flight_tokens < 64
-            and boundary // self.partial_block_size * self.partial_block_size <= hashed
-        )
-        if can_promote:
-            assert cache is not None
-            key = self._partial_key(request, boundary)
-            if not cache.contains(key):
-                managers = self.coordinator.single_type_managers
-                non_mamba_sources: dict[int, list[KVCacheBlock]] = {}
-                pinned_parents: list[KVCacheBlock] = []
-                seen_parent_ids: set[int] = set()
-                ok = True
-                for gid, manager in enumerate(managers):
-                    if gid in ckpt_map:
-                        continue
-                    req_blocks = manager.req_to_blocks.get(request.request_id)
-                    first, last = self._partial_block_range(manager, boundary)
-                    if not req_blocks or len(req_blocks) <= last:
-                        ok = False
-                        break
-                    group_sources = req_blocks[first : last + 1]
-                    if any(block.is_null for block in group_sources):
-                        ok = False
-                        break
-                    if first > 0 and isinstance(manager, FullAttentionManager):
-                        parents = req_blocks[:first]
-                        group_hashes = (
-                            request.block_hashes
-                            if manager.block_size == self.hash_block_size
-                            else BlockHashListWithBlockSize(
-                                request.block_hashes,
-                                self.hash_block_size,
-                                manager.block_size,
-                            )
-                        )
-                        if (
-                            len(group_hashes) < first
-                            or any(block.is_null for block in parents)
-                            or any(
-                                self.block_pool.get_cached_block(group_hashes[i], [gid])
-                                is None
-                                for i in range(first)
-                            )
-                        ):
-                            ok = False
-                            break
-                        for p_blk in parents:
-                            if p_blk.block_id not in seen_parent_ids:
-                                seen_parent_ids.add(p_blk.block_id)
-                                pinned_parents.append(p_blk)
-                    non_mamba_sources[gid] = group_sources
-                if ok:
-                    parity = (boundary // 64) & 1
-                    chosen = {gid: pair[parity] for gid, pair in ckpt_map.items()}
-                    unused = [pair[parity ^ 1] for pair in ckpt_map.values()]
-                    self._defer_release(unused)
-                    flat = [b for blks in non_mamba_sources.values() for b in blks]
-                    if flat:
-                        self.block_pool.touch(flat)
-                        self._defer_release(flat)
-                    if pinned_parents:
-                        self.block_pool.touch(pinned_parents)
-                    self._pending_decode_snapshots.append(
-                        (key, boundary, chosen, non_mamba_sources, pinned_parents)
-                    )
-                    return
-        all_ckpt = [b for pair in ckpt_map.values() for b in pair]
-        self._defer_release(all_ckpt)
-
-    def take_decode_ckpt_mounts(self) -> list[tuple[str, list[int], list[int]]]:
-        mounts, self._pending_decode_ckpt_mounts = self._pending_decode_ckpt_mounts, []
-        return mounts
-
-    def should_wait_for_inflight_snapshot(
-        self,
-        request: Request,
-        prefill_leaders: Sequence[tuple[Request, int, int]] = (),
-    ) -> bool:
-        """True if an active prefill leader in this step is already computing a
-        shared full block or partial-prefix boundary (>=256 tokens) for ``request``."""
-        cache = self.partial_cache
-        if cache is None or request.skip_reading_prefix_cache:
-            return False
-        hashed = len(request.block_hashes) * self.hash_block_size
-        if self._pending_snapshots and request.prefix_cache_boundaries:
-            req_keys = {
-                (b, self._partial_key(request, b))
-                for b in request.prefix_cache_boundaries
-                if 128 <= b < request.num_prompt_tokens
-                and b % self.partial_block_size
-                and b // self.partial_block_size * self.partial_block_size <= hashed
-                and not cache.contains(self._partial_key(request, b))
-            }
-            if req_keys:
-                for leader, boundary, num_preemptions in self._pending_snapshots:
-                    if (
-                        leader.num_preemptions != num_preemptions
-                        or leader.is_finished()
-                    ):
-                        continue
-                    if (boundary, self._partial_key(leader, boundary)) in req_keys:
-                        return True
-        if not prefill_leaders:
-            return False
-        req_lora = request.lora_request.lora_int_id if request.lora_request else 0
-        for leader, leader_start, leader_end in prefill_leaders:
-            if (
-                leader.is_finished()
-                or leader.skip_reading_prefix_cache
-                or leader.cache_salt != request.cache_salt
-            ):
-                continue
-            leader_lora = leader.lora_request.lora_int_id if leader.lora_request else 0
-            if leader_lora != req_lora:
-                continue
-            blk_idx = leader_start // self.hash_block_size
-            if (
-                blk_idx < len(leader.block_hashes)
-                and blk_idx < len(request.block_hashes)
-                and leader_start <= blk_idx * self.hash_block_size < leader_end
-                and leader.block_hashes[blk_idx] == request.block_hashes[blk_idx]
-            ):
-                return True
-            if request.prefix_cache_boundaries and leader.prefix_cache_boundaries:
-                for b in request.prefix_cache_boundaries:
-                    if (
-                        128 <= b < request.num_prompt_tokens
-                        and b % self.partial_block_size
-                        and leader_start < b <= leader.num_prompt_tokens
-                        and b in leader.prefix_cache_boundaries
-                        and b // self.partial_block_size * self.partial_block_size
-                        <= hashed
-                        and self._partial_key(request, b)
-                        == self._partial_key(leader, b)
-                        and not cache.contains(self._partial_key(request, b))
-                    ):
-                        return True
-        return False
-
-    def _reclaim_partial_blocks(
-        self,
-        num_blocks: int,
-        *,
-        protected: PartialEntry | None = None,
-        demand: dict[int, int] | None = None,
-    ) -> bool:
-        """Whether ``num_blocks`` (and per-partition ``demand``) are free,
-        releasing partial entries if needed.
-
-        Partial entries only save recomputation, so running requests take
-        precedence over them. Never evicts ``protected`` (an entry already
-        selected as the current request's partial hit).
-        """
-        cache = self.partial_cache
-        soft_reserve = min(24, self.block_pool.num_gpu_blocks // 8)
-        if cache is not None:
-            while (
-                num_blocks + soft_reserve > self.block_pool.get_num_free_blocks()
-                and (
-                    len(cache.entries) > 10
-                    or (
-                        len(cache.entries) > 2
-                        and cache.num_blocks > cache.max_blocks // 2
-                        and cache.has_cold_evictable(protected)
-                    )
-                )
-                and cache.evict_one(protected=protected)
-            ):
-                pass
-
-        def _satisfied() -> bool:
-            return num_blocks <= self.block_pool.get_num_free_blocks() and (
-                demand is None or self.block_pool.can_allocate_group_blocks(demand)
-            )
-
-        if _satisfied():
-            return True
-        while cache is not None and cache.evict_one(protected=protected):
-            if _satisfied():
-                return True
-        return _satisfied()
-
-    def take_block_copies(self) -> list[tuple[int, int]]:
-        copies, self._block_copies = self._block_copies, []
-        self._block_copy_groups = []
-        return copies
-
-    def take_block_copies_with_groups(
-        self,
-    ) -> tuple[list[tuple[int, int]], list[int]]:
-        copies, self._block_copies = self._block_copies, []
-        groups, self._block_copy_groups = self._block_copy_groups, []
-        return copies, groups
-
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
@@ -943,7 +221,6 @@ class KVCacheManager:
         # (which happens when the request requires prompt logprobs
         # or calls a pooling model with all pooling).
         request.shared_prefix_boundary = 0
-        request.partial_prefix_entry = None
         if not self.enable_caching or request.skip_reading_prefix_cache:
             return self.empty_kv_cache_blocks, 0
 
@@ -963,19 +240,6 @@ class KVCacheManager:
         # Keep the existing two-value lookup API used by 1Cat connectors. The
         # synchronous coordinator exposes the junction from this lookup only.
         request.shared_prefix_boundary = self.coordinator.shared_prefix_boundary
-        if (
-            _V41_SESSION_PREFIX
-            and num_new_computed_tokens
-            and not self._v41_session_hit(request, num_new_computed_tokens)
-        ):
-            request.shared_prefix_boundary = 0
-            return self.empty_kv_cache_blocks, 0
-
-        partial = self._partial_prefix_hit(
-            request, num_new_computed_tokens, max_cache_hit_length
-        )
-        if partial is not None:
-            computed_blocks, num_new_computed_tokens = partial
 
         if self.log_stats:
             assert self.prefix_cache_stats is not None
@@ -998,6 +262,7 @@ class KVCacheManager:
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
         full_sequence_must_fit: bool = False,
+        has_scheduled_reqs: bool = False,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -1097,61 +362,40 @@ class KVCacheManager:
             self.max_model_len,
         )
 
-        partial_entry = (
-            request.partial_prefix_entry
-            if new_computed_block_list is not self.empty_kv_cache_blocks.blocks
-            else None
-        )
+        watermark_blocks = 0
+        # The watermark is applied to waiting/preempted requests only, and
+        # only while at least one request is already scheduled, so an idle
+        # engine still serves a single long request and running requests are
+        # never throttled.
+        if has_scheduled_reqs and request.status in (
+            RequestStatus.WAITING,
+            RequestStatus.PREEMPTED,
+        ):
+            watermark_blocks = self.watermark_blocks
 
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
 
-            num_blocks_to_allocate, full_group_demand = (
-                self.coordinator.get_group_blocks_to_allocate(
-                    request_id=request.request_id,
-                    num_tokens=full_num_tokens,
-                    new_computed_blocks=new_computed_block_list,
-                    num_encoder_tokens=num_encoder_tokens,
-                    total_computed_tokens=total_computed_tokens,
-                    num_tokens_main_model=full_num_tokens,
-                    apply_admission_cap=True,
-                )
+            num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+                request_id=request.request_id,
+                num_tokens=full_num_tokens,
+                new_computed_blocks=new_computed_block_list,
+                num_encoder_tokens=num_encoder_tokens,
+                total_computed_tokens=total_computed_tokens,
+                num_tokens_main_model=full_num_tokens,
+                apply_admission_cap=True,
             )
-            if partial_entry is not None:
-                for gid, copy in enumerate(partial_entry.copy_last):
-                    if copy:
-                        num_blocks_to_allocate += 1
-                        full_group_demand[gid] = full_group_demand.get(gid, 0) + 1
-            if not self._reclaim_partial_blocks(
-                num_blocks_to_allocate,
-                protected=partial_entry,
-                demand=full_group_demand,
+            if (
+                num_blocks_to_allocate + watermark_blocks
+                > self.block_pool.get_num_free_blocks()
             ):
-                request.partial_prefix_entry = None
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
         num_tokens_need_slot = min(
             num_tokens_main_model + num_lookahead_tokens, self.max_model_len
         )
-
-        # Commit any full blocks whose tokens were verified in the prior step
-        # BEFORE remove_skipped_blocks() frees and nulls Mamba's superseded
-        # running-state column (e.g. when speculative decode crosses 2048*k).
-        processed_computed_tokens = max(
-            0, total_computed_tokens - request.num_in_flight_tokens
-        )
-        if (
-            self.enable_caching
-            and not delay_cache_blocks
-            and processed_computed_tokens > 0
-            and request.request_id
-            in self.coordinator.single_type_managers[0].num_cached_block
-        ):
-            self.coordinator.cache_blocks(
-                request, min(processed_computed_tokens, request.num_tokens)
-            )
 
         # Free the blocks that are skipped during the attention computation
         # (e.g., tokens outside the sliding window).
@@ -1164,35 +408,25 @@ class KVCacheManager:
         # tokens can roll it back.
         self.coordinator.remove_skipped_blocks(
             request.request_id,
-            processed_computed_tokens,
+            max(0, total_computed_tokens - request.num_in_flight_tokens),
             num_prompt_tokens=request.num_prompt_tokens,
         )
 
-        num_blocks_to_allocate, step_group_demand = (
-            self.coordinator.get_group_blocks_to_allocate(
-                request_id=request.request_id,
-                num_tokens=num_tokens_need_slot,
-                new_computed_blocks=new_computed_block_list,
-                num_encoder_tokens=num_encoder_tokens,
-                total_computed_tokens=num_local_computed_tokens
-                + num_external_computed_tokens,
-                num_tokens_main_model=num_tokens_main_model,
-            )
+        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=num_tokens_need_slot,
+            new_computed_blocks=new_computed_block_list,
+            num_encoder_tokens=num_encoder_tokens,
+            total_computed_tokens=num_local_computed_tokens
+            + num_external_computed_tokens,
+            num_tokens_main_model=num_tokens_main_model,
         )
-        if partial_entry is not None:
-            # Private copy-on-write blocks.
-            for gid, copy in enumerate(partial_entry.copy_last):
-                if copy:
-                    num_blocks_to_allocate += 1
-                    step_group_demand[gid] = step_group_demand.get(gid, 0) + 1
 
-        if not self._reclaim_partial_blocks(
-            num_blocks_to_allocate,
-            protected=partial_entry,
-            demand=step_group_demand,
+        if (
+            num_blocks_to_allocate + watermark_blocks
+            > self.block_pool.get_num_free_blocks()
         ):
             # Cannot allocate new blocks
-            request.partial_prefix_entry = None
             return None
 
         if (
@@ -1207,9 +441,6 @@ class KVCacheManager:
                 num_local_computed_tokens=num_local_computed_tokens,
                 num_external_computed_tokens=num_external_computed_tokens,
             )
-            if partial_entry is not None:
-                self._redirect_partial_hit(request, partial_entry)
-                request.partial_prefix_entry = None
 
         new_blocks = self.coordinator.allocate_new_blocks(
             request.request_id,
@@ -1234,26 +465,6 @@ class KVCacheManager:
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
-        if (
-            self._enable_decode_ckpt
-            and request.request_id not in self._decode_ckpt_blocks
-            and total_computed_tokens >= request.num_prompt_tokens
-        ):
-            self._maybe_mount_decode_ckpt(request, total_computed_tokens)
-
-        if self.partial_cache is not None and request.prefix_cache_boundaries:
-            step_end = total_computed_tokens + num_new_tokens
-            if (
-                step_end in request.prefix_cache_boundaries
-                and step_end % self.partial_block_size
-                and step_end < request.num_prompt_tokens
-            ):
-                # The state at ``step_end`` exists once this step has run;
-                # snapshot it before the next step advances it.
-                self._pending_snapshots.append(
-                    (request, step_end, request.num_preemptions)
-                )
-
         return self.create_kv_cache_blocks(new_blocks)
 
     def free(self, request: Request) -> None:
@@ -1264,29 +475,6 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
-        if _V41_SESSION_PREFIX:
-            self._v41_last = (list(request.all_token_ids), request.num_computed_tokens)
-        ckpt_entry = self._decode_ckpt_blocks.pop(request.request_id, None)
-        if ckpt_entry is not None and self._pending_decode_ckpt_mounts:
-            self._pending_decode_ckpt_mounts = [
-                m
-                for m in self._pending_decode_ckpt_mounts
-                if m[0] != request.request_id
-            ]
-        committed_computed = max(
-            0, request.num_computed_tokens - request.num_in_flight_tokens
-        )
-        valid_len = min(committed_computed, len(request.all_token_ids) - 1)
-        if (
-            self.enable_caching
-            and request.is_finished()
-            and valid_len > 0
-            and request.request_id
-            in self.coordinator.single_type_managers[0].num_cached_block
-        ):
-            self.coordinator.cache_blocks(request, valid_len)
-        if ckpt_entry is not None:
-            self._retire_decode_ckpt(request, ckpt_entry, valid_len)
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
@@ -1326,19 +514,6 @@ class KVCacheManager:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
-        if self.partial_cache is not None:
-            self.partial_cache.clear()
-            for _, _, chosen, _, pinned_parents in self._pending_decode_snapshots:
-                self.block_pool.free_blocks(list(chosen.values()) + pinned_parents)
-            for _, blocks in self._deferred_release:
-                self.block_pool.free_blocks(blocks)
-            self._deferred_release = []
-            self._pending_snapshots = []
-            self._pending_decode_snapshots = []
-            self._pending_decode_ckpt_mounts = []
-            self._block_copies = []
-            self._block_copy_groups = []
-            self._copy_origin_this_step.clear()
         if not self.block_pool.reset_prefix_cache():
             return False
         if self.log_stats:
@@ -1482,18 +657,4 @@ class KVCacheManager:
 
     def new_step_starts(self) -> None:
         """Called when a new step is started."""
-        self._step += 1
-        self._copy_origin_this_step.clear()
-        if self._deferred_release:
-            keep = []
-            for release_step, blocks in self._deferred_release:
-                if release_step <= self._step:
-                    self.block_pool.free_blocks(blocks)
-                else:
-                    keep.append((release_step, blocks))
-            self._deferred_release = keep
-        if self._pending_snapshots:
-            self._materialize_snapshots()
-        if self._pending_decode_snapshots:
-            self._materialize_decode_snapshots()
         self.coordinator.new_step_starts()
