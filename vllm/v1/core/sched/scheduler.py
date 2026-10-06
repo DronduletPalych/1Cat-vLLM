@@ -315,6 +315,7 @@ class Scheduler(SchedulerInterface):
             num_speculative_tokens=self.num_spec_tokens,
             retention_policy=self.cache_config.retention,
             enable_decode_ckpt=vllm_config.use_v2_model_runner,
+            watermark=self.scheduler_config.watermark,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -1256,6 +1257,7 @@ class Scheduler(SchedulerInterface):
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
+                        has_scheduled_reqs=bool(self.running),
                     )
 
                     if new_blocks is not None:
@@ -1627,6 +1629,7 @@ class Scheduler(SchedulerInterface):
                         delay_cache_blocks=load_kv_async,
                         num_encoder_tokens=num_encoder_tokens,
                         full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                        has_scheduled_reqs=bool(self.running),
                     )
                 except KVPartialHitDriftError as e:
                     self._recover_partial_hit_drift(e.request, e.entry)

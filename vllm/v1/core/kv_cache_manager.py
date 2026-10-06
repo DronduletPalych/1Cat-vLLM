@@ -36,7 +36,7 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_sliding_window,
 )
 from vllm.v1.metrics.stats import PrefixCacheStats
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
 
@@ -174,9 +174,14 @@ class KVCacheManager:
         num_speculative_tokens: int = 0,
         retention_policy: KVRetentionConfig | None = None,
         enable_decode_ckpt: bool = False,
+        watermark: float = 0.0,
     ) -> None:
         self.max_model_len = max_model_len
         self.num_speculative_tokens = num_speculative_tokens
+        # Watermark: minimum number of KV cache blocks to keep free when
+        # admitting waiting/preempted requests. 0.0 disables it.
+        assert watermark >= 0.0, "watermark must be non-negative"
+        self.watermark_blocks = int(watermark * kv_cache_config.num_blocks)
         # When unset, fall back to `max_model_len` so the recycling-aware cap
         # collapses to the prior (uncapped) admission behavior. The scheduler
         # always supplies the real value at runtime.
@@ -998,6 +1003,7 @@ class KVCacheManager:
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
         full_sequence_must_fit: bool = False,
+        has_scheduled_reqs: bool = False,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -1102,6 +1108,16 @@ class KVCacheManager:
             if new_computed_block_list is not self.empty_kv_cache_blocks.blocks
             else None
         )
+        watermark_blocks = 0
+        # The watermark is applied to waiting/preempted requests only, and
+        # only while at least one request is already scheduled, so an idle
+        # engine still serves a single long request and running requests are
+        # never throttled.
+        if has_scheduled_reqs and request.status in (
+            RequestStatus.WAITING,
+            RequestStatus.PREEMPTED,
+        ):
+            watermark_blocks = self.watermark_blocks
 
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
@@ -1123,7 +1139,10 @@ class KVCacheManager:
                     if copy:
                         num_blocks_to_allocate += 1
                         full_group_demand[gid] = full_group_demand.get(gid, 0) + 1
-            if not self._reclaim_partial_blocks(
+            if (
+                num_blocks_to_allocate + watermark_blocks
+                > self.block_pool.get_num_free_blocks()
+            ) or not self._reclaim_partial_blocks(
                 num_blocks_to_allocate,
                 protected=partial_entry,
                 demand=full_group_demand,
@@ -1186,7 +1205,10 @@ class KVCacheManager:
                     num_blocks_to_allocate += 1
                     step_group_demand[gid] = step_group_demand.get(gid, 0) + 1
 
-        if not self._reclaim_partial_blocks(
+        if (
+            num_blocks_to_allocate + watermark_blocks
+            > self.block_pool.get_num_free_blocks()
+        ) or not self._reclaim_partial_blocks(
             num_blocks_to_allocate,
             protected=partial_entry,
             demand=step_group_demand,
