@@ -99,9 +99,10 @@ class Qwen35Adapter:
     architecture_label = "Qwen3.5"
     packed_embeddings = True
 
-    def __init__(self, config, tp_size=1):
+    def __init__(self, config, tp_size=1, multimodal=False):
         self.config = config
         self.tp_size = tp_size
+        self.multimodal = multimodal
         self.fallback_reasons = {}
         repeat, remainder = divmod(
             config.linear_num_value_heads, config.linear_num_key_heads
@@ -114,11 +115,87 @@ class Qwen35Adapter:
             else None
         )
 
+    def _map_vision_name(self, name):
+        """Map a llama.cpp ``clip`` mmproj tensor to the model's ``visual.*`` name.
+
+        The mmproj is a standalone GGUF (architecture ``clip``) with the
+        standard llama.cpp CLIP layout: ``v.blk.{b}.{attn_qkv,attn_out,ffn_up,
+        ffn_down,ln1,ln2}`` for each of the vision blocks, a two-layer MLP
+        projector (``mm.0``/``mm.2``), and ``v.post_ln``/``v.patch_embd``/
+        ``v.position_embd``. These map onto ``Qwen3_VisionTransformer``.
+        Returns None for non-vision names.
+        """
+        if not self.multimodal:
+            return None
+        m = re.fullmatch(r"v\.blk\.(\d+)\.(attn_qkv|attn_out|ffn_up|ffn_down|ln1|ln2)\.(weight|bias)", name)
+        if m:
+            block, part, suffix = int(m[1]), m[2], m[3]
+            part_map = {
+                "attn_qkv": "attn.qkv",
+                "attn_out": "attn.proj",
+                "ffn_up": "mlp.linear_fc1",
+                "ffn_down": "mlp.linear_fc2",
+                "ln1": "norm1",
+                "ln2": "norm2",
+            }
+            # attn_qkv is a single fused QKV tensor; QKVParallelLinear splits it
+            # on load (loaded_shard_id is None with output_dim set), so no
+            # manual q/k/v splitting is needed here.
+            return f"model.visual.blocks.{block}.{part_map[part]}.{suffix}"
+        if name == "mm.0.weight":
+            self._vision_names.add(name)
+            return "model.visual.merger.linear_fc1.weight"
+        if name == "mm.0.bias":
+            self._vision_names.add(name)
+            return "model.visual.merger.linear_fc1.bias"
+        if name == "mm.2.weight":
+            self._vision_names.add(name)
+            return "model.visual.merger.linear_fc2.weight"
+        if name == "mm.2.bias":
+            self._vision_names.add(name)
+            return "model.visual.merger.linear_fc2.bias"
+        if name == "v.post_ln.weight":
+            self._vision_names.add(name)
+            return "model.visual.merger.norm.weight"
+        if name == "v.post_ln.bias":
+            self._vision_names.add(name)
+            return "model.visual.merger.norm.bias"
+        if name == "v.position_embd.weight":
+            self._vision_names.add(name)
+            return "model.visual.pos_embed.weight"
+        if name == "v.patch_embd.weight":
+            self._vision_names.add(name)
+            return "model.visual.patch_embed.proj.weight"
+        if name == "v.patch_embd.bias":
+            self._vision_names.add(name)
+            return "model.visual.patch_embed.proj.bias"
+        # v.patch_embd.weight.1 is a duplicate patch-conv storage entry; drop it.
+        if name == "v.patch_embd.weight.1":
+            return None
+        return None
+
     def build_name_map(self, tensors):
         result = {}
+        self._vision_names = set()
+
+        def _text_name(base):
+            # In multimodal mode the Qwen3_5ForConditionalGeneration mapper
+            # routes `model.language_model.` -> `language_model.model.` and
+            # `model.visual.` -> `visual.`. The text-only
+            # Qwen3_5ForCausalLM keeps the flat `model.*` layout. Only the
+            # leading `model.` is re-rooted; `lm_head.weight` (no `model.`
+            # prefix) is left untouched for the mapper's `lm_head.` rule.
+            if self.multimodal and base.startswith("model."):
+                return "model.language_model." + base[len("model."):]
+            return base
+
         for name in tensors:
             if name in self.global_names:
-                result[name] = self.global_names[name]
+                result[name] = _text_name(self.global_names[name])
+                continue
+            vision_name = self._map_vision_name(name)
+            if vision_name is not None:
+                result[name] = vision_name
                 continue
             match = re.fullmatch(r"blk\.(\d+)\.(.+)", name)
             if match:
@@ -131,7 +208,9 @@ class Qwen35Adapter:
                     ):
                         continue
                 elif suffix in self.layer_names:
-                    result[name] = f"model.layers.{block}.{self.layer_names[suffix]}"
+                    result[name] = _text_name(
+                        f"model.layers.{block}.{self.layer_names[suffix]}"
+                    )
                     continue
             raise ValueError(f"Unmapped {self.architecture_label} GGUF tensor: {name}")
         return result
@@ -141,6 +220,13 @@ class Qwen35Adapter:
         return name.endswith(".weight") and not name.endswith(
             ("norm.weight", "conv1d.weight", "embed_tokens.weight")
         )
+
+    def _is_vision_name(self, name):
+        # Vision tensors (from the clip mmproj) are always F16 and must be
+        # loaded through the model's dense nn.Linear / Conv3d / QKVParallelLinear
+        # parameters, never through the GGUF .qweight path, and never through
+        # the -1 norm restoration applied to RMSNorm.
+        return self.multimodal and name.startswith("model.visual.")
 
     def needs_dense_fallback(self, name, tensor):
         if not name.endswith(
@@ -203,6 +289,8 @@ class Qwen35Adapter:
         # All linear type descriptors must arrive before any weight payload,
         # including F16/F32 shards mixed with packed GGML shards.
         for raw, name in name_map.items():
+            if self._is_vision_name(name):
+                continue
             packed_embedding = (
                 self.packed_embeddings
                 and not getattr(self.config, "tie_word_embeddings", False)
@@ -250,6 +338,7 @@ class Qwen35Adapter:
                 yield name, _dequantize_embedding(tensor, dtype, raw)
                 continue
             dense_fallback = self.needs_dense_fallback(name, tensor)
+            vision = self._is_vision_name(name)
             if quantized and (not self.is_linear(name) or dense_fallback):
                 # Embeddings and convolution use the model's dense parameters.
                 data = dequantize(tensor.data, tensor.tensor_type)
@@ -260,8 +349,9 @@ class Qwen35Adapter:
                 weight = torch.from_numpy(data).view(torch.bfloat16)
             else:
                 weight = torch.from_numpy(tensor.data.copy())
-            weight = self.restore(name, weight)
-            if not quantized or dense_fallback or not self.is_linear(name):
+            if not vision:
+                weight = self.restore(name, weight)
+            if not quantized or dense_fallback or not self.is_linear(name) or vision:
                 # The model keeps A_log in FP32 even under --dtype half.
                 # Preserve inverse-log precision rather than rounding through
                 # FP16 before the destination parameter copies it back to FP32.
@@ -272,6 +362,6 @@ class Qwen35Adapter:
                         f"GGUF {raw}: values overflow {dtype}; use --dtype float32"
                     )
                 weight = converted
-            if self.is_linear(name):
+            if self.is_linear(name) and not vision:
                 name = name.removesuffix(".weight") + ".qweight"
             yield name, weight
