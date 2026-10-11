@@ -136,6 +136,16 @@ class GGUFModelLoader(BaseModelLoader):
             local = self._prepare_weights(model_config)
             self._native_adapter = adapter
             self._native_tensors = gguf_tensor_index(gguf_shard_paths(local))
+            # A multimodal GGUF ships the vision tower + projector as a
+            # separate ``clip``-architecture mmproj GGUF next to the backbone.
+            # Index it on its own (the architecture differs from the backbone,
+            # so the two sets of tensors cannot share a single
+            # gguf_tensor_index call) and merge into the backbone index.
+            from vllm.transformers_utils.gguf_utils import detect_gguf_multimodal
+
+            mmproj_path = detect_gguf_multimodal(local)
+            if mmproj_path is not None:
+                self._native_tensors.update(gguf_tensor_index([mmproj_path]))
             return adapter.build_name_map(self._native_tensors)
         # Get text config to handle both nested (multimodal) and flat
         # (text-only) config structures. For multimodal models like
