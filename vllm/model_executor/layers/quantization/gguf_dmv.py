@@ -253,7 +253,7 @@ def restore(
         if fmt == 5
         else 18
     )
-    result = _prepared_gguf_projection(
+    _prepared_gguf_projection(
         rows,
         weight,
         stats,
@@ -267,8 +267,8 @@ def restore(
         n,
         cache_bands,
         blas_bands,
+        out=out,
     )
-    out.copy_(result)
 
 
 def prepare_layer(layer, projections):
