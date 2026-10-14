@@ -75,6 +75,7 @@ def _prepared_gguf_projection(
     logical_size: int,
     cache_bands: list[int],
     blas_bands: list[int],
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # Keep M-dependent policy behind an opaque op: vLLM's range compilation
     # drops Dynamo guards and would otherwise freeze the prefill branch.
@@ -112,7 +113,11 @@ def _prepared_gguf_projection(
         return out.reshape(*x.shape[:-1], logical_size)
     if cache is not None and _supports_band(rows.shape[0], cache_bands):
         return torch.mm(rows, cache.T).reshape(*x.shape[:-1], logical_size)
-    output = torch.empty((rows.shape[0], output_size), dtype=x.dtype, device=x.device)
+    if out is None:
+        out = torch.empty(
+            (rows.shape[0], output_size), dtype=x.dtype, device=x.device
+        )
+    output = out
     if _supports_band(rows.shape[0], blas_bands):
         # The already prepared shared scratch is internal to this op. Passing
         # its aliased views through Dynamo would materialize full-size clones
@@ -162,6 +167,7 @@ def _prepared_gguf_projection_fake(
     logical_size: int,
     cache_bands: list[int],
     blas_bands: list[int],
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty((*x.shape[:-1], logical_size), dtype=x.dtype, device=x.device)
 
