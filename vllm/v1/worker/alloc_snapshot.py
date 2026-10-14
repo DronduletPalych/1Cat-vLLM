@@ -20,6 +20,7 @@ Output files:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -111,25 +112,23 @@ def capture_snapshot(
     except Exception as e:
         result["snapshot_error"] = str(e)
         # Ensure history is disabled even on failure
-        try:
+        with contextlib.suppress(Exception):
             torch.cuda.memory._record_memory_history(enabled=False)
-        except Exception:
-            pass
 
     # Per-pool / per-stream stats (if available)
-    try:
+    with contextlib.suppress(Exception):
         stats = torch.accelerator.memory_stats(device)
         pool_keys = {k: v for k, v in stats.items() if "pool" in k.lower()}
         if pool_keys:
             result["pool_stats"] = pool_keys
-    except Exception:
-        pass
-
     path.write_text(json.dumps(result, indent=2, default=str))
     n_events = len(result.get("allocation_events", []))
     logger.info(
         "AllocSnapshot rank=%d context=%s events=%d -> %s",
-        rank, context, n_events, path,
+        rank,
+        context,
+        n_events,
+        path,
     )
     return result
 
@@ -150,7 +149,9 @@ def on_oom(
         return
     logger.warning(
         "AllocSnapshot: OOM at rank=%d context=%s: %s",
-        rank, context, str(exc)[:300],
+        rank,
+        context,
+        str(exc)[:300],
     )
     try:
         capture_snapshot(device, rank, f"oom_{context}", include_history=True)
