@@ -114,9 +114,7 @@ def _prepared_gguf_projection(
     if cache is not None and _supports_band(rows.shape[0], cache_bands):
         return torch.mm(rows, cache.T).reshape(*x.shape[:-1], logical_size)
     if out is None:
-        out = torch.empty(
-            (rows.shape[0], output_size), dtype=x.dtype, device=x.device
-        )
+        out = torch.empty((rows.shape[0], output_size), dtype=x.dtype, device=x.device)
     output = out
     if _supports_band(rows.shape[0], blas_bands):
         # The already prepared shared scratch is internal to this op. Passing
