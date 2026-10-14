@@ -48,6 +48,7 @@ from vllm.distributed.weight_transfer import (
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.ple_offload_layer import ple_offload_enabled
+from vllm.v1.worker import alloc_snapshot
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
@@ -1250,9 +1251,24 @@ class Worker(WorkerBase):
             )
 
         with self.annotate_profile(scheduler_output):
-            output = self.model_runner.execute_model(
-                scheduler_output, intermediate_tensors
-            )
+            # One-shot static-baseline capture per rank (no-op when
+            # VLLM_ALLOC_SNAPSHOT_DIR is unset).
+            alloc_snapshot.calibration_capture(self.device, self.rank)
+            try:
+                output = self.model_runner.execute_model(
+                    scheduler_output, intermediate_tensors
+                )
+            except torch.cuda.OutOfMemoryError:
+                # Guaranteed snapshot at the exact OOM moment: splits
+                # reserved-unalloc into mapped-free / deferred-free /
+                # fragmented-small blocks. Re-raises unchanged.
+                alloc_snapshot.on_oom(
+                    self.device,
+                    self.rank,
+                    "execute_model",
+                    torch.cuda.OutOfMemoryError,
+                )
+                raise
             if (
                 self.use_v2_model_runner
                 and self.model_runner.is_pooling_model
