@@ -1354,12 +1354,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="configuration",
         declared_default="None",
-        effective_default=(
-            "None; instrumentation disabled, all hooks are no-ops."
-        ),
-        automatic_conditions=(
-            "vllm/v1/worker/alloc_snapshot.py:_env_dir",
-        ),
+        effective_default="None; instrumentation disabled, all hooks are no-ops.",
+        automatic_conditions="vllm/v1/worker/alloc_snapshot.py:_env_dir",
         acceleration_paths=(),
         user_visible=True,
     ),
