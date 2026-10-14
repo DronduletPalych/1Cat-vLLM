@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from vllm.envs_metadata import bind_env_names, env_var, warn_deprecated_once
 
 if TYPE_CHECKING:
+    VLLM_ALLOC_SNAPSHOT_DIR: str | None = None
     VLLM_SM70_DEBUG: set[str] = set()
     VLLM_SM70_E4M3_LONG_ATTENTION: str | None = None
     VLLM_CPU_CI_ENV: str | None = None
@@ -1342,6 +1343,22 @@ def _resolve_rust_frontend_path() -> str | None:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "VLLM_ALLOC_SNAPSHOT_DIR": env_var(
+        lambda: os.getenv("VLLM_ALLOC_SNAPSHOT_DIR"),
+        description=(
+            "Directory for allocator snapshot instrumentation. When unset, "
+            "all snapshot hooks are no-ops with zero overhead. When set, "
+            "captures calibration (first forward per rank) and OOM-time "
+            "allocator snapshots (full allocation traces + segment summaries) "
+            "to JSON files in this directory for post-mortem OOM analysis."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None; instrumentation disabled, all hooks are no-ops.",
+        automatic_conditions="vllm/v1/worker/alloc_snapshot.py:_env_dir",
+        acceleration_paths=(),
+        user_visible=True,
+    ),
     "VLLM_SM70_E4M3_LONG_ATTENTION": env_var(
         lambda: os.getenv("VLLM_SM70_E4M3_LONG_ATTENTION"),
         description=(
@@ -14935,14 +14952,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # GC debug config
     # - VLLM_GC_DEBUG=0: disable GC debugger
-    # - VLLM_GC_DEBUG=1: enable GC debugger with gc.collect elpased times
+    # - VLLM_GC_DEBUG=1: enable GC debugger with gc.collect elapsed times
     # - VLLM_GC_DEBUG='{"top_objects":5}': enable GC debugger with
     #                                      top 5 collected objects
     "VLLM_GC_DEBUG": env_var(
         lambda: os.getenv("VLLM_GC_DEBUG", ""),
         description=(
             "GC debug config - VLLM_GC_DEBUG=0: disable GC debugger - "
-            "VLLM_GC_DEBUG=1: enable GC debugger with gc.collect elpased times"
+            "VLLM_GC_DEBUG=1: enable GC debugger with gc.collect elapsed times"
             " - VLLM_GC_DEBUG='{\"top_objects\":5}': enable GC debugger with top"
             " 5 collected objects"
         ),
