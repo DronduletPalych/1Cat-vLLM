@@ -26,6 +26,19 @@ _CACHE_POLICIES: dict[str, type[CachePolicy]] = {
 }
 
 
+class _UnionKeys:
+    """Read-only membership view over two key collections, without copying."""
+
+    __slots__ = ("_a", "_b")
+
+    def __init__(self, a: Collection[OffloadKey], b: Collection[OffloadKey]):
+        self._a = a
+        self._b = b
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._a or key in self._b
+
+
 class CPUOffloadingManager(OffloadingManager):
     """
     An OffloadingManager with a pluggable CachePolicy (LRU or ARC).
@@ -149,6 +162,7 @@ class CPUOffloadingManager(OffloadingManager):
         self,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
+        extra_protected: Collection[OffloadKey] | None = None,
     ) -> PrepareStoreOutput | None:
         if self.counts is not None:
             keys = [k for k in keys if self.counts.get(k, 0) >= self.store_threshold]
@@ -168,7 +182,9 @@ class CPUOffloadingManager(OffloadingManager):
         if num_blocks_to_evict > 0:
             # Blocks from the original input are excluded from eviction candidates:
             # a block that was already stored must remain in the cache after this call.
-            protected = set(keys)
+            protected: set[OffloadKey] | _UnionKeys = set(keys)
+            if extra_protected:
+                protected = _UnionKeys(protected, extra_protected)
             evicted = self._policy.evict(num_blocks_to_evict, protected)
             if evicted is None:
                 return None
@@ -312,12 +328,17 @@ class GroupedCPUOffloadingManager(OffloadingManager):
             self.managers[group_idx].complete_load(group_keys, req_context)
 
     def prepare_store(
-        self, keys: Collection[OffloadKey], req_context: ReqContext
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+        extra_protected: Collection[OffloadKey] | None = None,
     ) -> PrepareStoreOutput | None:
         block_ids: dict[OffloadKey, int] = {}
         evicted_keys: list[OffloadKey] = []
         for group_idx, group_keys in self._partition(keys).items():
-            output = self.managers[group_idx].prepare_store(group_keys, req_context)
+            output = self.managers[group_idx].prepare_store(
+                group_keys, req_context, extra_protected=extra_protected
+            )
             if output is None:
                 # The scheduler advances every group's store cursor on success.
                 # Release only this call's new reservations so all groups retry.

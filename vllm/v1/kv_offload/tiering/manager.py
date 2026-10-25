@@ -161,6 +161,12 @@ class TieringOffloadingManager(OffloadingManager):
         # Reset at the end of each step in take_events().
         self._processed_jobs_this_step: bool = False
 
+        # Primary-tier keys reported as a hit by lookup() during the current
+        # engine step. The scheduler counts them and only pins them later via
+        # prepare_load(); a promotion started by a later lookup in the same
+        # step must not evict them. Cleared at the end of each step.
+        self._step_hit_keys: set[OffloadKey] = set()
+
         # Per-request set of secondary tiers that requested REQUEST_LEVEL
         # policy. Populated in on_new_request(),
         # cleaned up in on_request_finished().
@@ -247,6 +253,7 @@ class TieringOffloadingManager(OffloadingManager):
 
         primary_hit = self.primary_tier.lookup(key, req_context)
         if primary_hit is True:
+            self._step_hit_keys.add(key)
             return True
         if primary_hit is None:
             return None
@@ -292,7 +299,9 @@ class TieringOffloadingManager(OffloadingManager):
         # Must happen immediately so primary.lookup() returns None (in-flight)
         # for this key on any subsequent lookup() call within the same step,
         # preventing duplicate promotion attempts.
-        primary_write_result = self.primary_tier.prepare_write([key], req_context)
+        primary_write_result = self.primary_tier.prepare_write(
+            [key], req_context, extra_protected=self._step_hit_keys
+        )
 
         if primary_write_result is None:
             # Primary tier is full; caller should treat the block as unavailable
@@ -579,6 +588,11 @@ class TieringOffloadingManager(OffloadingManager):
         self._maybe_process_finished_jobs()
 
         self._flush_pending_promotions()
+
+        # Every hit reported this step has been pinned by prepare_load() or
+        # belongs to a request that was not scheduled; stop protecting them
+        # from promotion eviction in later steps.
+        self._step_hit_keys.clear()
 
         # Reset the per-step gate so next step's first call does real work.
         self._processed_jobs_this_step = False
