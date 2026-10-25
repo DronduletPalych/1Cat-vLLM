@@ -20,9 +20,6 @@ from vllm.model_executor.layers.quantization.gguf_transcode import (
     AFFINE_U2_TYPES,
 )
 from vllm.model_executor.layers.quantization.utils import replace_parameter
-from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import (
-    workspace_pool,
-)
 from vllm.scalar_type import scalar_types
 from vllm.transformers_utils.gguf_tensor_reader import quant_type_name
 
@@ -67,7 +64,7 @@ _AFFINE_BLAS_MIN_M = {
     (8, 32, 1536, 2560): 4096,
     (8, 32, 160, 2560): 6144,
 }
-_affine_blas_workspaces: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
+_affine_blas_workspaces: dict = {}
 _affine_blas_views: dict = {}
 
 
@@ -83,7 +80,13 @@ def _get_affine_blas_workspace(
     (elements=None) only borrow the scratch their prepared shape reserved.
     """
     key = (weight.device, torch.float16)
-    pool = workspace_pool("gguf_affine_blas", _affine_blas_workspaces)
+    # This scratch is bound while weights are prepared and read again inside
+    # forward contexts, where `workspace_pool` resolves a different per-forward
+    # registry. Prepare-time entries must therefore live in one process-global
+    # pool, and that pool must own them: a weak value let the only copy be
+    # collected whenever its prepared views were dropped, so the admitted BLAS
+    # path raised on its first use (DFlash fused context K/V).
+    pool = _affine_blas_workspaces
     workspace = pool.get(key)
     if elements is None or (workspace is not None and workspace.numel() >= elements):
         return workspace
@@ -92,7 +95,7 @@ def _get_affine_blas_workspace(
     except torch.OutOfMemoryError:
         return None
     pool[key] = grown
-    views = workspace_pool("gguf_affine_blas_views", _affine_blas_views)
+    views = _affine_blas_views
     for ref, k, n in views.get(key, ()):
         layer = ref()
         if layer is not None:
@@ -108,7 +111,7 @@ def _bind_affine_blas_workspace(
     if workspace is None:
         return False
     key = (weight.device, torch.float16)
-    views = workspace_pool("gguf_affine_blas_views", _affine_blas_views)
+    views = _affine_blas_views
     views.setdefault(key, []).append((weakref.ref(layer), k, n))
     layer.gguf_tm_blas_workspace = workspace[: k * n].view(k, n)
     return True

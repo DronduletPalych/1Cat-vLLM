@@ -552,15 +552,13 @@ class GGUFModelLoader(BaseModelLoader):
         weight_type_map = self._get_gguf_weight_type(
             model_config, local_model_path, gguf_weights_map
         )
-        # filter out unquantized modules to skip
+        # Each adapter declares whether its vocabulary arrives packed. qwen35
+        # already does, because GGUFEmbeddingMethod.create_weights registers
+        # only `qweight`: a dense yield targets `embed_tokens.weight`, which the
+        # module does not own, so the loader logs "not found in params_dict" and
+        # the vocabulary stays uninitialized until the first forward fails.
+        # Draft adapters without a packed vocabulary keep their dense default.
         adapter = getattr(self, "_native_adapter", None)
-        if adapter is not None:
-            adapter.packed_embeddings = (
-                getattr(
-                    vllm_config.kernel_config.sm70_gguf, "embedding_storage", "dense"
-                )
-                == "original"
-            )
         unquant_names = [
             name.removesuffix(".weight")
             for name, weight_type in weight_type_map.items()
