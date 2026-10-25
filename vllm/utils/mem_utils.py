@@ -33,6 +33,11 @@ def loaded_cuda_model_storage(models: Mapping[str, Any]) -> dict[str, Any]:
                 layer.named_buffers(recurse=False)
             )
             for key, tensor in tensors:
+                if isinstance(tensor, torch.nn.parameter.UninitializedParameter):
+                    # GGUF keeps its packed weights as lazy parameters until the
+                    # loader materializes them; touching numel()/storage() here
+                    # raises instead of measuring anything.
+                    continue
                 if not tensor.is_cuda or not tensor.numel():
                     continue
                 storage = tensor.untyped_storage()
