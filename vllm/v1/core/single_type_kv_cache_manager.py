@@ -1605,9 +1605,13 @@ class MambaManager(SingleTypeKVCacheManager):
         blocks = self.req_to_blocks[request.request_id]
         for block_idx in range(num_cached_blocks_before, num_full_blocks):
             block = blocks[block_idx]
-            if block.is_null or block.block_hash is None:
+            if block.is_null:
                 continue
-            self.cached_blocks_this_step.add(block.block_hash)
+            # A block whose mask kept it out of the hash map has no hash, but
+            # its boundary state is still addressable: the offload key comes
+            # from the request's block hashes, not from the GPU block.
+            if block.block_hash is not None:
+                self.cached_blocks_this_step.add(block.block_hash)
             if self.mamba_cache_mode == "align":
                 self._pending_boundary_state_offloads.append(
                     (

@@ -1058,6 +1058,7 @@ class OffloadingConnectorScheduler:
                 )
 
             still_pending: list[tuple[int, int, int]] = []
+            by_boundary: dict[int, list[tuple[int, int, int]]] = {}
             for entry in pending:
                 group_idx, block_id, boundary_tokens = entry
                 group_config = self._group_config_by_idx[group_idx]
@@ -1068,16 +1069,32 @@ class OffloadingConnectorScheduler:
                     or boundary_tokens % group_config.offloaded_block_size != 0
                 ):
                     continue
+                by_boundary.setdefault(boundary_tokens, []).append(entry)
 
-                offload_block_idx = (
-                    boundary_tokens // group_config.offloaded_block_size - 1
-                )
-                group_state = req_status.group_states[group_idx]
-                if offload_block_idx >= len(group_state.offload_keys):
+            # One CPU page holds every KV group of a token block, so all groups
+            # of a boundary must be handed to the manager as a single job.
+            for boundary_tokens, entries in by_boundary.items():
+                keys: list[OffloadKey] = []
+                key_info: dict[OffloadKey, tuple[int, int, int]] = {}
+                for group_idx, block_id, _ in entries:
+                    group_config = self._group_config_by_idx[group_idx]
+                    offload_block_idx = (
+                        boundary_tokens // group_config.offloaded_block_size - 1
+                    )
+                    group_state = req_status.group_states[group_idx]
+                    if offload_block_idx >= len(group_state.offload_keys):
+                        continue
+                    offload_key = group_state.offload_keys[offload_block_idx]
+                    keys.append(offload_key)
+                    key_info[offload_key] = (
+                        group_idx,
+                        block_id,
+                        boundary_tokens // group_config.gpu_block_size - 1,
+                    )
+                if not keys:
                     continue
-                offload_key = group_state.offload_keys[offload_block_idx]
                 store_output = self.manager.prepare_store(
-                    [offload_key], req_status.req_context
+                    keys, req_status.req_context
                 )
                 if store_output is None:
                     logger.debug(
@@ -1086,32 +1103,35 @@ class OffloadingConnectorScheduler:
                         req_id,
                         boundary_tokens,
                     )
-                    still_pending.append(entry)
+                    still_pending.extend(entries)
                     continue
                 keys_to_store = set(store_output.keys_to_store)
                 if not keys_to_store:
                     continue
-                assert keys_to_store == {offload_key}
+
+                ordered_keys = [k for k in keys if k in keys_to_store]
+                group_sizes = [0] * num_groups
+                block_indices = [0] * num_groups
+                src_block_ids: list[int] = []
+                for offload_key in ordered_keys:
+                    group_idx, block_id, gpu_block_idx = key_info[offload_key]
+                    src_block_ids.append(block_id)
+                    group_sizes[group_idx] = 1
+                    block_indices[group_idx] = gpu_block_idx
 
                 job_id = self._generate_job_id()
                 req_status.transfer_jobs.add(job_id)
-                self._block_id_to_pending_jobs.setdefault(block_id, set()).add(job_id)
+                for bid in src_block_ids:
+                    self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
                 self._jobs[job_id] = TransferJobStatus(
                     req_id=req_id,
                     pending_count=self.config.num_workers,
                     keys=keys_to_store,
                     is_store=True,
-                    sliding_window_block_ids=[block_id],
-                )
-
-                group_sizes = [0] * num_groups
-                group_sizes[group_idx] = 1
-                block_indices = [0] * num_groups
-                block_indices[group_idx] = (
-                    boundary_tokens // group_config.gpu_block_size - 1
+                    sliding_window_block_ids=src_block_ids,
                 )
                 src_spec = GPULoadStoreSpec(
-                    [block_id],
+                    src_block_ids,
                     group_sizes=group_sizes,
                     block_indices=block_indices,
                 )
