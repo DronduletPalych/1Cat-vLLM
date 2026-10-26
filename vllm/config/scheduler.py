@@ -186,6 +186,18 @@ class SchedulerConfig:
     admission, avoiding the eviction/preemption churn that collapses decode
     throughput near the pool ceiling. 0.0 (the default) disables it."""
 
+    watermark_output_reserve_tokens: int = Field(default=16384, ge=0)
+    """Cap on the output tokens the admission watermark reserves per request.
+
+    A request that does not pass ``max_tokens`` gets ``max_model_len -
+    prompt_len`` from the OpenAI endpoint, so reserving the full requested
+    maximum reserves (almost) the whole context window for every request and
+    serializes admissions: the pool looks 12% full while exactly one request
+    runs. Reserving at most this many output tokens keeps the guarantee for
+    the actual generation while allowing several requests to be admitted in
+    parallel. 0 restores the uncapped reservation."""
+
+
     async_scheduling: bool | None = None
     """If set to False, disable async scheduling. Async scheduling helps to
     avoid gaps in GPU utilization, leading to better latency and throughput.
