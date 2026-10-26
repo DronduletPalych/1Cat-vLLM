@@ -391,24 +391,19 @@ class KVCacheManager:
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
             )
-            other_reserved = 0
-            for rid, full_blocks in self._reserved_blocks.items():
-                if rid == request.request_id:
-                    continue
-                allocated = max(
-                    (
-                        len(mgr.req_to_blocks.get(rid, ()))
-                        for mgr in self.coordinator.single_type_managers
-                    ),
-                    default=0,
-                )
-                other_reserved += max(0, full_blocks - allocated)
-            if (
-                num_blocks_to_allocate + watermark_blocks + other_reserved
-                > self.block_pool.get_num_free_blocks()
-            ):
+            # Watermark: reserve prompt + max output of every admitted request
+            # and keep (1 - watermark) of the pool as the ceiling. It must hold
+            # regardless of how large the incoming request is.
+            block_size = self.coordinator.single_type_managers[0].block_size
+            output_blocks = cdiv(getattr(request, "max_tokens", 0) or 0, block_size)
+            new_reserved = num_blocks_to_allocate + output_blocks
+            used = sum(
+                v for rid, v in self._reserved_blocks.items() if rid != request.request_id
+            )
+            budget = getattr(self.block_pool, "num_gpu_blocks", 0) - watermark_blocks
+            if used + new_reserved > budget:
                 return None
-            self._reserved_blocks[request.request_id] = num_blocks_to_allocate
+            self._reserved_blocks[request.request_id] = new_reserved
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
         num_tokens_need_slot = min(
