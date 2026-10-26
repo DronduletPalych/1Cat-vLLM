@@ -593,13 +593,19 @@ class OffloadingConnectorScheduler:
                 if sliding_window_size_in_blocks is not None:
                     offload_keys = offload_keys[-sliding_window_size_in_blocks:]
                 if any(key in self._blocks_being_loaded for key in offload_keys):
-                    # hit blocks are being loaded, delay request
+                    # A block needed by this prefix is still being loaded for
+                    # another request. Deferring here is only safe while the
+                    # engine keeps stepping: an engine with no running request
+                    # never polls the worker, so the load can never finish and
+                    # the deferred request never wakes (idle pool, hung agent).
+                    # The CPU tier loads synchronously, so treat it as a miss
+                    # and let this request serve the shorter prefix it holds.
                     logger.debug(
-                        "Delaying request %s since some of its"
-                        " blocks are already being loaded",
+                        "Request %s: hit blocks are being loaded by another "
+                        "request; treating the overlapping prefix as a miss",
                         req_status.req.request_id,
                     )
-                    return None
+                    return 0
 
         logger.debug(
             "Request %s hit %s offloaded tokens after %s GPU hit tokens",
