@@ -324,6 +324,7 @@ class Scheduler(SchedulerInterface):
             retention_policy=self.cache_config.retention,
             enable_decode_ckpt=vllm_config.use_v2_model_runner,
             watermark=self.scheduler_config.watermark,
+            watermark_output_reserve=self.scheduler_config.watermark_output_reserve_tokens,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
