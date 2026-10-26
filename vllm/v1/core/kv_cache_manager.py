@@ -436,7 +436,18 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
         )
 
-        if (
+        if self.kv_cache_tokens and request.status in (
+            RequestStatus.WAITING,
+            RequestStatus.PREEMPTED,
+        ):
+            # Token-budget watermark, the same rule as the full-sequence gate.
+            new_tokens = request.num_tokens + (getattr(request, "max_tokens", 0) or 0)
+            used = sum(
+                v for rid, v in self._reserved_tokens.items() if rid != request.request_id
+            )
+            if used + new_tokens > self.kv_cache_tokens - self.watermark_tokens:
+                return None
+        elif (
             num_blocks_to_allocate + watermark_blocks
             > self.block_pool.get_num_free_blocks()
         ):
