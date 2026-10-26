@@ -231,24 +231,27 @@ class CPUOffloadingSpec(OffloadingSpec):
             # Maximum entries in the internal tracker's LRU table.
             max_tracker_size = int(self.extra_config.get("max_tracker_size", 64_000))
 
-            def create_manager(num_blocks: int) -> CPUOffloadingManager:
+            def create_manager(
+                num_blocks: int, share_pages: bool
+            ) -> CPUOffloadingManager:
                 return CPUOffloadingManager(
                     num_blocks=num_blocks,
                     cache_policy=self.eviction_policy,  # type: ignore[arg-type]
                     enable_events=enable_events,
                     store_threshold=store_threshold,
                     max_tracker_size=max_tracker_size,
+                    share_pages=share_pages,
                 )
 
             self._manager = (
                 GroupedCPUOffloadingManager(
                     {
-                        i: create_manager(num_blocks)
+                        i: create_manager(num_blocks, share_pages=False)
                         for i, num_blocks in self.cpu_group_num_blocks.items()
                     }
                 )
                 if self.partition_by_group
-                else create_manager(self.num_blocks)
+                else create_manager(self.num_blocks, share_pages=True)
             )
         return self._manager
 

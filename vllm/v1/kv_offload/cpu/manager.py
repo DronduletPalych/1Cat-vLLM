@@ -13,6 +13,7 @@ from vllm.v1.kv_offload.base import (
     PrepareStoreOutput,
     ReqContext,
     RequestOffloadingContext,
+    get_offload_block_hash,
     get_offload_group_idx,
 )
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
@@ -43,6 +44,7 @@ class CPUOffloadingManager(OffloadingManager):
         enable_events: bool = False,
         store_threshold: int = 1,
         max_tracker_size: int = 64_000,
+        share_pages: bool = False,
     ):
         self.medium: str = CPULoadStoreSpec.medium()
         self._num_blocks: int = num_blocks
@@ -63,6 +65,11 @@ class CPUOffloadingManager(OffloadingManager):
         self.counts: OrderedDict[OffloadKey, int] | None = (
             OrderedDict() if store_threshold >= 2 else None
         )
+        # CPU block id -> every group key stored in that page. One page holds
+        # all KV groups of a token block, so several keys share a BlockStatus.
+        # Grouped pools address disjoint per-group tensors and never share one.
+        self.share_pages: bool = share_pages
+        self._keys_by_block: dict[int, set[OffloadKey]] = {}
 
     # --- block pool ---
 
@@ -122,11 +129,19 @@ class CPUOffloadingManager(OffloadingManager):
         req_context: ReqContext,
     ) -> LoadStoreSpec:
         blocks = []
+        pinned: set[int | tuple[int, int]] = set()
         for key in keys:
             block = self._policy.get(key)
             assert block is not None, f"Block {key!r} not found in cache"
             assert block.is_ready, f"Block {key!r} is not ready for reading"
-            block.ref_cnt += 1
+            page = (
+                block.block_id
+                if self.share_pages
+                else (get_offload_group_idx(key), block.block_id)
+            )
+            if page not in pinned:
+                block.ref_cnt += 1
+                pinned.add(page)
             blocks.append(block)
         return self._get_load_store_spec(keys, blocks)
 
@@ -139,9 +154,18 @@ class CPUOffloadingManager(OffloadingManager):
     def complete_load(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> None:
+        released: set[int | tuple[int, int]] = set()
         for key in keys:
             block = self._policy.get(key)
             assert block is not None, f"Block {key!r} not found"
+            page = (
+                block.block_id
+                if self.share_pages
+                else (get_offload_group_idx(key), block.block_id)
+            )
+            if page in released:
+                continue
+            released.add(page)
             assert block.ref_cnt > 0, f"Block {key!r} ref_cnt is already 0"
             block.ref_cnt -= 1
 
@@ -152,7 +176,105 @@ class CPUOffloadingManager(OffloadingManager):
     ) -> PrepareStoreOutput | None:
         if self.counts is not None:
             keys = [k for k in keys if self.counts.get(k, 0) >= self.store_threshold]
-        # filter out blocks that are already stored
+
+        if not self.share_pages:
+            return self._prepare_store_per_key(keys)
+
+        # A CPU page holds every KV group of one token block. Group the keys by
+        # block hash so all groups of a block share one page and one block id.
+        by_hash: dict[bytes, list[OffloadKey]] = {}
+        for key in keys:
+            by_hash.setdefault(get_offload_block_hash(key), []).append(key)
+
+        attached: set[OffloadKey] = set()
+        new_hashes: list[bytes] = []
+        for block_hash, group_keys in by_hash.items():
+            block = next(
+                (
+                    self._policy.get(k)
+                    for k in group_keys
+                    if self._policy.get(k) is not None
+                ),
+                None,
+            )
+            if block is None:
+                new_hashes.append(block_hash)
+                continue
+            for k in group_keys:
+                if self._policy.get(k) is None:
+                    self._policy.insert(k, block)
+                    self._keys_by_block.setdefault(block.block_id, set()).add(k)
+                    attached.add(k)
+
+        if not new_hashes and not attached:
+            return PrepareStoreOutput(
+                keys_to_store=[],
+                store_spec=self._get_load_store_spec([], []),
+                evicted_keys=[],
+            )
+
+        num_blocks_to_evict = len(new_hashes) - self._get_num_free_blocks()
+
+        to_evict: list[OffloadKey] = []
+        if num_blocks_to_evict > 0:
+            # Blocks from the original input are excluded from eviction candidates:
+            # a block that was already stored must remain in the cache after this call.
+            protected = set(keys)
+            evicted = self._policy.evict(num_blocks_to_evict, protected)
+            if evicted is None:
+                return None
+            for key, block in evicted:
+                for k in list(self._keys_by_block.pop(block.block_id, {key})):
+                    if k != key and self._policy.get(k) is not None:
+                        self._policy.remove(k)
+                self._free_block(block)
+                to_evict.append(key)
+
+        if to_evict and self.events is not None:
+            self.events.append(
+                OffloadingEvent(
+                    keys=to_evict,
+                    medium=self.medium,
+                    removed=True,
+                )
+            )
+
+        blocks = self._allocate_blocks([OffloadKey(h) for h in new_hashes])
+        assert len(blocks) == len(new_hashes), (
+            "Block pool did not allocate the expected number of blocks"
+        )
+
+        block_by_key: dict[OffloadKey, BlockStatus] = {}
+        for block_hash, block in zip(new_hashes, blocks):
+            for key in by_hash[block_hash]:
+                self._policy.insert(key, block)
+                self._keys_by_block.setdefault(block.block_id, set()).add(key)
+                block_by_key[key] = block
+
+        for key in attached:
+            block = self._policy.get(key)
+            if block is not None:
+                block_by_key[key] = block
+
+        # Keep the caller's key order: the scheduler builds the source spec in
+        # that order and the two sides must line up block for block.
+        store_set = set(block_by_key)
+        keys_to_store = [k for k in keys if k in store_set]
+        store_spec = self._get_load_store_spec(
+            keys_to_store, [block_by_key[k] for k in keys_to_store]
+        )
+
+        return PrepareStoreOutput(
+            keys_to_store=keys_to_store,
+            store_spec=store_spec,
+            evicted_keys=to_evict,
+        )
+
+    def _prepare_store_per_key(
+        self, keys: Collection[OffloadKey]
+    ) -> PrepareStoreOutput | None:
+        # Grouped pools give every key its own slot: block ids address disjoint
+        # per-group tensors, so keys must never be merged by block hash.
         keys_to_store = [k for k in keys if self._policy.get(k) is None]
 
         if not keys_to_store:
@@ -166,8 +288,6 @@ class CPUOffloadingManager(OffloadingManager):
 
         to_evict: list[OffloadKey] = []
         if num_blocks_to_evict > 0:
-            # Blocks from the original input are excluded from eviction candidates:
-            # a block that was already stored must remain in the cache after this call.
             protected = set(keys)
             evicted = self._policy.evict(num_blocks_to_evict, protected)
             if evicted is None:
@@ -193,7 +313,6 @@ class CPUOffloadingManager(OffloadingManager):
         for key, block in zip(keys_to_store, blocks):
             self._policy.insert(key, block)
 
-        # build store specs for allocated blocks
         store_spec = self._get_load_store_spec(keys_to_store, blocks)
 
         return PrepareStoreOutput(
@@ -209,19 +328,47 @@ class CPUOffloadingManager(OffloadingManager):
         success: bool = True,
     ) -> None:
         stored_keys: list[OffloadKey] = []
+        seen: set[int | tuple[int, int]] = set()
 
         if success:
             for key in keys:
                 block = self._policy.get(key)
-                if block is not None and not block.is_ready:
+                if block is None:
+                    continue
+                page = (
+                    block.block_id
+                    if self.share_pages
+                    else (get_offload_group_idx(key), block.block_id)
+                )
+                if page in seen:
+                    continue
+                seen.add(page)
+                if not block.is_ready:
                     block.ref_cnt = 0
                     stored_keys.append(key)
         else:
             for key in keys:
                 block = self._policy.get(key)
-                if block is not None and not block.is_ready:
+                if block is None:
+                    continue
+                page = (
+                    block.block_id
+                    if self.share_pages
+                    else (get_offload_group_idx(key), block.block_id)
+                )
+                if page in seen:
+                    continue
+                seen.add(page)
+                if block.is_ready:
+                    continue
+                if not self.share_pages:
                     self._policy.remove(key)
                     self._free_block(block)
+                    continue
+                for k in list(self._keys_by_block.pop(block.block_id, ())):
+                    if self._policy.get(k) is not None:
+                        self._policy.remove(k)
+                self._free_block(block)
 
         if stored_keys and self.events is not None:
             self.events.append(
@@ -239,6 +386,7 @@ class CPUOffloadingManager(OffloadingManager):
         # flushes in-flight load job IDs to the workers before any new stores
         # can begin, preventing a cross-direction data race on reused offload block IDs.
         self._policy.clear()
+        self._keys_by_block.clear()
 
         self._free_list.clear()
         self._num_allocated_blocks = 0
