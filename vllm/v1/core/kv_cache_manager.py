@@ -182,6 +182,11 @@ class KVCacheManager:
         # admitting waiting/preempted requests. 0.0 disables it.
         assert watermark >= 0.0, "watermark must be non-negative"
         self.watermark_blocks = int(watermark * kv_cache_config.num_blocks)
+        # Full-sequence block reservations of admitted requests. A request that
+        # passed the full-ISL admission gate will need these blocks even while
+        # its prefill is still chunked, so a later admission must not spend
+        # them.
+        self._reserved_blocks: dict[str, int] = {}
         # When unset, fall back to `max_model_len` so the recycling-aware cap
         # collapses to the prior (uncapped) admission behavior. The scheduler
         # always supplies the real value at runtime.
@@ -1139,8 +1144,20 @@ class KVCacheManager:
                     if copy:
                         num_blocks_to_allocate += 1
                         full_group_demand[gid] = full_group_demand.get(gid, 0) + 1
+            other_reserved = 0
+            for rid, full_blocks in self._reserved_blocks.items():
+                if rid == request.request_id:
+                    continue
+                allocated = max(
+                    (
+                        len(mgr.req_to_blocks.get(rid, ()))
+                        for mgr in self.coordinator.single_type_managers
+                    ),
+                    default=0,
+                )
+                other_reserved += max(0, full_blocks - allocated)
             if (
-                num_blocks_to_allocate + watermark_blocks
+                num_blocks_to_allocate + watermark_blocks + other_reserved
                 > self.block_pool.get_num_free_blocks()
             ) or not self._reclaim_partial_blocks(
                 num_blocks_to_allocate,
@@ -1149,6 +1166,7 @@ class KVCacheManager:
             ):
                 request.partial_prefix_entry = None
                 return None
+            self._reserved_blocks[request.request_id] = num_blocks_to_allocate
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
         num_tokens_need_slot = min(
@@ -1310,6 +1328,7 @@ class KVCacheManager:
         if ckpt_entry is not None:
             self._retire_decode_ckpt(request, ckpt_entry, valid_len)
         self.coordinator.free(request.request_id)
+        self._reserved_blocks.pop(request.request_id, None)
 
     def remove_skipped_blocks(
         self,

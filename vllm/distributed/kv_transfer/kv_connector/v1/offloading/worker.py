@@ -260,7 +260,10 @@ class OffloadingConnectorWorker:
         self._unsubmitted_store_jobs.clear()
 
         for job_id, entry in metadata.load_jobs.items():
-            self._load_jobs[job_id] = entry.req_id
+            # Loads are synchronous now: the scheduler does not park the
+            # request in WAITING_FOR_REMOTE_KVS, so it must not receive a
+            # finished_recving signal either (the core asserts that the
+            # request is finished when it gets one outside that state).
             success = self.worker.transfer_async(job_id, entry.transfer_spec)
             assert success
         # The scheduler now issues host-tier loads synchronously, so the data
