@@ -186,7 +186,7 @@ class SchedulerConfig:
     admission, avoiding the eviction/preemption churn that collapses decode
     throughput near the pool ceiling. 0.0 (the default) disables it."""
 
-    watermark_output_reserve_tokens: int = Field(default=16384, ge=0)
+    watermark_output_reserve_tokens: int = Field(default=32768, ge=0)
     """Cap on the output tokens the admission watermark reserves per request.
 
     A request that does not pass ``max_tokens`` gets ``max_model_len -
@@ -195,7 +195,9 @@ class SchedulerConfig:
     serializes admissions: the pool looks 12% full while exactly one request
     runs. Reserving at most this many output tokens keeps the guarantee for
     the actual generation while allowing several requests to be admitted in
-    parallel. 0 restores the uncapped reservation."""
+    parallel. Defaults to the implicit output limit applied when a request
+    omits `max_tokens` (DEFAULT_MAX_OUTPUT_TOKENS). 0 restores the uncapped
+    reservation."""
 
 
     async_scheduling: bool | None = None
