@@ -143,7 +143,7 @@ def test_group_pool_lifecycle_and_order(policy):
     out = m.prepare_store(keys, CTX)
     assert out.keys_to_store == keys
     assert list(out.store_spec.block_ids) == [0, 0, 1]
-    assert m.lookup(keys[0], CTX) is None
+    assert m.lookup(keys[0], CTX) is False
     m.complete_store(keys, CTX)
     assert list(m.prepare_load(keys, CTX).block_ids) == [0, 0, 1]
     # A blocked group defers the entire operation, releasing other reservations.
@@ -556,7 +556,7 @@ def test_deferred_store_preserves_existing_and_inflight_keys(policy):
     m.prepare_load(pinned, CTX)
     assert m.prepare_store([ready, inflight, fresh, key(5, 3)], CTX) is None
     assert m.lookup(ready, CTX) is True
-    assert m.lookup(inflight, CTX) is None
+    assert m.lookup(inflight, CTX) is False
     assert m.lookup(fresh, CTX) is False
     m.complete_store([inflight], CTX)
     assert m.lookup(inflight, CTX) is True

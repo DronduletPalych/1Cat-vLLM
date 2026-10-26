@@ -79,6 +79,9 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
             num_blocks=num_blocks,
             cache_policy=cache_policy,  # type: ignore[arg-type]
             enable_events=enable_events,
+            # Secondary tiers promote asynchronously; the scheduler must retry
+            # rather than treat an in-flight promotion as a miss.
+            defer_inflight_lookup=True,
         )
         self._mmap_region = mmap_region
         # read/write is for CPU<->secondary transfers,
