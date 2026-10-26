@@ -793,6 +793,14 @@ class OffloadingConnectorScheduler:
             req_status.update_offload_keys()
             req = req_status.req
 
+            # A load in flight owns the request's transfer slot; a store may
+            # only be issued for a request whose pending transfer is a store.
+            # Retry on a later step instead of tripping the invariant below.
+            if req_status.transfer_jobs:
+                any_jid = next(iter(req_status.transfer_jobs))
+                if not self._jobs[any_jid].is_store:
+                    continue
+
             if preempted:
                 for group_state in req_status.group_states:
                     group_state.block_ids.clear()
@@ -1048,6 +1056,12 @@ class OffloadingConnectorScheduler:
                 continue
             req_status.update_offload_keys()
             req = req_status.req
+
+            # Keep boundary offers pending until the in-flight load finishes.
+            if req_status.transfer_jobs:
+                any_jid = next(iter(req_status.transfer_jobs))
+                if not self._jobs[any_jid].is_store:
+                    continue
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
             num_offloadable_tokens = min(
                 req.num_computed_tokens + num_scheduled_tokens,
