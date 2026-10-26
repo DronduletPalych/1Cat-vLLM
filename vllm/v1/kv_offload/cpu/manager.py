@@ -45,6 +45,7 @@ class CPUOffloadingManager(OffloadingManager):
         store_threshold: int = 1,
         max_tracker_size: int = 64_000,
         share_pages: bool = False,
+        defer_inflight_lookup: bool = False,
     ):
         self.medium: str = CPULoadStoreSpec.medium()
         self._num_blocks: int = num_blocks
@@ -69,6 +70,11 @@ class CPUOffloadingManager(OffloadingManager):
         # all KV groups of a token block, so several keys share a BlockStatus.
         # Grouped pools address disjoint per-group tensors and never share one.
         self.share_pages: bool = share_pages
+        # A tier with an asynchronous secondary tier answers ``None`` so the
+        # scheduler retries once the promotion lands. Without one, an
+        # in-flight write must be a miss: parking the request would leave an
+        # idle engine unable to complete the write it is waiting on.
+        self.defer_inflight_lookup: bool = defer_inflight_lookup
         self._keys_by_block: dict[int, set[OffloadKey]] = {}
 
     # --- block pool ---
@@ -120,7 +126,15 @@ class CPUOffloadingManager(OffloadingManager):
         if block is None:
             return False
         if not block.is_ready:
-            return None  # write in-flight; caller should retry
+            # A store for this page is still in flight. Returning None asks the
+            # scheduler to defer the request to its skipped-waiting queue, which
+            # is only revisited on engine steps. An engine with no running
+            # requests never takes a step, so it never polls the worker for the
+            # completed transfer, the page never becomes ready, and the request
+            # never wakes: a permanent stall with the KV pool idle. Treat the
+            # in-flight page as a miss instead; the caller uses the shorter
+            # prefix it already has and hits this page on a later request.
+            return None if self.defer_inflight_lookup else False
         return True
 
     def prepare_load(
