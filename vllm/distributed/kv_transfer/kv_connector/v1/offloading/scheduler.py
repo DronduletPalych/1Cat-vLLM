@@ -846,6 +846,9 @@ class OffloadingConnectorScheduler:
                 if group_config.requires_exact_boundary_source:
                     continue
                 num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
+                # A preempted request loses blocks before its hashes are
+                # rebuilt, so the key list can trail num_offloadable_tokens.
+                num_blocks = min(num_blocks, len(group_state.offload_keys))
                 start_block_idx = group_state.next_stored_block_idx
                 if num_blocks <= start_block_idx:
                     continue
