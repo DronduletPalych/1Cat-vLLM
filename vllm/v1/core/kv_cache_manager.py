@@ -415,7 +415,7 @@ class KVCacheManager:
             # Watermark: reserve prompt + max output of every admitted request
             # and keep (1 - watermark) of the token budget as the ceiling. It
             # must hold regardless of how large the incoming request is.
-            new_reserved = request.num_tokens + _reserved_output_tokens(request)
+            new_reserved = request.num_tokens + self._reserved_output_tokens(request)
             used = sum(
                 v for rid, v in self._reserved_tokens.items() if rid != request.request_id
             )
@@ -459,7 +459,7 @@ class KVCacheManager:
             RequestStatus.PREEMPTED,
         ):
             # Token-budget watermark, the same rule as the full-sequence gate.
-            new_tokens = request.num_tokens + _reserved_output_tokens(request)
+            new_tokens = request.num_tokens + self._reserved_output_tokens(request)
             used = sum(
                 v for rid, v in self._reserved_tokens.items() if rid != request.request_id
             )
