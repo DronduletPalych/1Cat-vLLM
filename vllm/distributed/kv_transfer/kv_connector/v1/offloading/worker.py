@@ -263,6 +263,10 @@ class OffloadingConnectorWorker:
             self._load_jobs[job_id] = entry.req_id
             success = self.worker.transfer_async(job_id, entry.transfer_spec)
             assert success
+        # The scheduler now issues host-tier loads synchronously, so the data
+        # must be resident before the forward pass reads it.
+        if metadata.load_jobs:
+            self.worker.wait(set(metadata.load_jobs))
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for job_id, entry in metadata.store_jobs.items():

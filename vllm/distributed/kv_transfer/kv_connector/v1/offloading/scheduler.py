@@ -672,7 +672,12 @@ class OffloadingConnectorScheduler:
 
         self._touch(req_status)
 
-        return num_hit_tokens, bool(num_hit_tokens)
+        # The host tier loads between scheduler steps; the core parks the
+        # request in WAITING_FOR_REMOTE_KVS until the worker reports
+        # finished_recving. An idle engine never runs start_load_kv, so that
+        # wait has no way to end when this request is the only one queued.
+        # Load synchronously inside the step instead.
+        return num_hit_tokens, False
 
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
