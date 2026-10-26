@@ -847,8 +847,13 @@ class OffloadingConnectorScheduler:
                     continue
                 num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
                 # A preempted request loses blocks before its hashes are
-                # rebuilt, so the key list can trail num_offloadable_tokens.
-                num_blocks = min(num_blocks, len(group_state.offload_keys))
+                # rebuilt, so both the key list and the block-ID list can
+                # trail num_offloadable_tokens.
+                num_blocks = min(
+                    num_blocks,
+                    len(group_state.offload_keys),
+                    len(group_state.block_ids) // block_size_factor,
+                )
                 start_block_idx = group_state.next_stored_block_idx
                 if num_blocks <= start_block_idx:
                     continue
