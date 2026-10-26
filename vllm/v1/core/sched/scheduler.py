@@ -39,6 +39,7 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.kv_cache_utils import get_max_concurrency_for_kv_cache_config
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.mixed_prefill import MixedPrefillBudget
 from vllm.v1.core.sched.output import (
@@ -268,9 +269,14 @@ class Scheduler(SchedulerInterface):
         # Create the KV cache manager.
         if hash_block_size is None:
             hash_block_size = block_size
+        kv_cache_tokens = int(
+            get_max_concurrency_for_kv_cache_config(vllm_config, kv_cache_config)
+            * self.max_model_len
+        )
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
+            kv_cache_tokens=kv_cache_tokens,
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
             use_eagle=self.use_eagle,
