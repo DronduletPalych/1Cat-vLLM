@@ -44,7 +44,10 @@ from vllm.v1.core.kv_cache_manager import (
     KVPartialHitDriftError,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import is_lookahead_block_hashing_enabled
+from vllm.v1.core.kv_cache_utils import (
+    get_max_concurrency_for_kv_cache_config,
+    is_lookahead_block_hashing_enabled,
+)
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.mixed_prefill import MixedPrefillBudget
 from vllm.v1.core.sched.output import (
@@ -297,9 +300,14 @@ class Scheduler(SchedulerInterface):
         if hash_block_size is None:
             hash_block_size = block_size
         self.hash_block_size = hash_block_size
+        kv_cache_tokens = int(
+            get_max_concurrency_for_kv_cache_config(vllm_config, kv_cache_config)
+            * self.max_model_len
+        )
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
+            kv_cache_tokens=kv_cache_tokens,
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
             use_eagle=self.use_eagle_block_drop,

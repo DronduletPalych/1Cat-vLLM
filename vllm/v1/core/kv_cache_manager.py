@@ -175,6 +175,7 @@ class KVCacheManager:
         retention_policy: KVRetentionConfig | None = None,
         enable_decode_ckpt: bool = False,
         watermark: float = 0.0,
+        kv_cache_tokens: int | None = None,
     ) -> None:
         self.max_model_len = max_model_len
         self.num_speculative_tokens = num_speculative_tokens
@@ -182,11 +183,13 @@ class KVCacheManager:
         # admitting waiting/preempted requests. 0.0 disables it.
         assert watermark >= 0.0, "watermark must be non-negative"
         self.watermark_blocks = int(watermark * kv_cache_config.num_blocks)
-        # Full-sequence block reservations of admitted requests. A request that
-        # passed the full-ISL admission gate will need these blocks even while
-        # its prefill is still chunked, so a later admission must not spend
-        # them.
-        self._reserved_blocks: dict[str, int] = {}
+        # Full reservations (prompt + max output, in tokens) of admitted
+        # requests. A chunked prefill has not allocated its whole sequence
+        # yet, so a later admission must not spend what the earlier one was
+        # already promised.
+        self._reserved_tokens: dict[str, int] = {}
+        self.kv_cache_tokens = kv_cache_tokens or 0
+        self.watermark_tokens = int(watermark * self.kv_cache_tokens)
         # When unset, fall back to `max_model_len` so the recycling-aware cap
         # collapses to the prior (uncapped) admission behavior. The scheduler
         # always supplies the real value at runtime.
@@ -1145,23 +1148,24 @@ class KVCacheManager:
                         num_blocks_to_allocate += 1
                         full_group_demand[gid] = full_group_demand.get(gid, 0) + 1
             # Watermark: reserve prompt + max output of every admitted request
-            # and keep (1 - watermark) of the pool as the ceiling. It must hold
-            # regardless of how large the incoming request is.
-            block_size = self.coordinator.single_type_managers[0].block_size
-            output_blocks = cdiv(getattr(request, "max_tokens", 0) or 0, block_size)
-            new_reserved = num_blocks_to_allocate + output_blocks
+            # and keep (1 - watermark) of the token budget as the ceiling. It
+            # must hold regardless of how large the incoming request is.
+            new_reserved = request.num_tokens + (getattr(request, "max_tokens", 0) or 0)
             used = sum(
-                v for rid, v in self._reserved_blocks.items() if rid != request.request_id
+                v for rid, v in self._reserved_tokens.items() if rid != request.request_id
             )
-            budget = getattr(self.block_pool, "num_gpu_blocks", 0) - watermark_blocks
-            if used + new_reserved > budget or not self._reclaim_partial_blocks(
-                num_blocks_to_allocate,
-                protected=partial_entry,
-                demand=full_group_demand,
+            budget = self.kv_cache_tokens - self.watermark_tokens
+            if self.kv_cache_tokens and (
+                used + new_reserved > budget
+                or not self._reclaim_partial_blocks(
+                    num_blocks_to_allocate,
+                    protected=partial_entry,
+                    demand=full_group_demand,
+                )
             ):
                 request.partial_prefix_entry = None
                 return None
-            self._reserved_blocks[request.request_id] = new_reserved
+            self._reserved_tokens[request.request_id] = new_reserved
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
         num_tokens_need_slot = min(
@@ -1323,7 +1327,7 @@ class KVCacheManager:
         if ckpt_entry is not None:
             self._retire_decode_ckpt(request, ckpt_entry, valid_len)
         self.coordinator.free(request.request_id)
-        self._reserved_blocks.pop(request.request_id, None)
+        self._reserved_tokens.pop(request.request_id, None)
 
     def remove_skipped_blocks(
         self,
