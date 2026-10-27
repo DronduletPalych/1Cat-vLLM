@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import islice
@@ -337,6 +338,19 @@ class OffloadingConnectorScheduler:
 
     def __init__(self, spec: OffloadingSpec):
         self.config = SchedulerOffloadConfig.from_spec(spec)
+        # A spec-decoding draft writes unverified tokens into the trailing
+        # block. The core drops that block from prefix-cache hits for groups it
+        # knows are EAGLE/MTP groups, but DFlash draft groups are never
+        # annotated (upstream issue #57032), so the host tier would serve the
+        # unverified block back as a hit and the target would generate from a
+        # state the verifier never accepted. Withhold the trailing block here.
+        self._drop_last_prefix_block = (
+            getattr(spec.vllm_config, "speculative_config", None) is not None
+        )
+        self._hit_block_tokens = max(
+            (g.offloaded_block_size for g in self.config.kv_group_configs),
+            default=0,
+        )
         self._group_config_by_idx = {
             group.group_idx: group for group in self.config.kv_group_configs
         }
@@ -607,6 +621,11 @@ class OffloadingConnectorScheduler:
                     )
                     return 0
 
+        if self._drop_last_prefix_block and num_hit_tokens > 0:
+            # Never take the trailing block back from the host tier while a
+            # draft model may have written unverified tokens into it.
+            num_hit_tokens = max(0, num_hit_tokens - self._hit_block_tokens)
+
         logger.debug(
             "Request %s hit %s offloaded tokens after %s GPU hit tokens",
             req_status.req.request_id,
@@ -710,12 +729,34 @@ class OffloadingConnectorScheduler:
             num_gpu_blocks = cdiv(num_cached_tokens, gpu_block_size)
 
             assert len(group_blocks) >= num_gpu_blocks
-            num_locally_computed_gpu_blocks = num_gpu_blocks
-            # Skip null placeholder blocks (used for sliding window or mamba padding).
-            for i, block in enumerate(group_blocks[:num_gpu_blocks]):
-                if not block.is_null and block.block_hash is None:
-                    num_locally_computed_gpu_blocks = i
-                    break
+            # How many of these GPU blocks the core already filled locally.
+            # Derive it from the token count, not from a missing block hash:
+            # the core assigns block hashes to blocks it allocates for an
+            # external load too, so "no hash" does not mark a pending block.
+            # Treating such blocks as locally computed skips the load entirely
+            # while the scheduler still counts the prefix as a hit, leaving
+            # the request to generate from KV that was never written.
+            local_blocks = min(
+                num_gpu_blocks, num_locally_computed_tokens // gpu_block_size
+            )
+            sliding_window_size_in_blocks = (
+                group_config.sliding_window_size_in_blocks
+            )
+            if sliding_window_size_in_blocks is None:
+                num_locally_computed_gpu_blocks = local_blocks
+            else:
+                # Sparse groups (sliding window, Mamba align) only need the
+                # tail window: earlier blocks carry no state this group can
+                # serve. Keep the pending span inside the window.
+                window = sliding_window_size_in_blocks * self.config.block_size_factor
+                num_locally_computed_gpu_blocks = max(
+                    local_blocks, num_gpu_blocks - window
+                )
+            # Null placeholder blocks (sliding window or Mamba padding) carry no
+            # data and must not widen the pending span past the window above.
+            # The window/token accounting already bounds it, so no extra scan
+            # is applied here: a placeholder early in the range would otherwise
+            # reset the local count and push the span back to the full prefix.
 
             assert (
                 num_locally_computed_tokens
@@ -733,9 +774,13 @@ class OffloadingConnectorScheduler:
             num_blocks = cdiv(num_cached_tokens, offloaded_block_size)
             assert len(offload_keys) >= num_blocks
             if num_pending_gpu_blocks:
-                start_block_idx = (
-                    num_locally_computed_gpu_blocks // self.config.block_size_factor
+                # Derive the start from the pending span so the number of
+                # offload keys matches the blocks the worker will copy (true
+                # for a full prefix and for a sparse tail window alike).
+                pending_offload_blocks = cdiv(
+                    num_pending_gpu_blocks, self.config.block_size_factor
                 )
+                start_block_idx = max(0, num_blocks - pending_offload_blocks)
                 keys_to_load.extend(offload_keys[start_block_idx:num_blocks])
 
             dst_block_ids.extend(
@@ -768,6 +813,28 @@ class OffloadingConnectorScheduler:
         dst_spec = GPULoadStoreSpec(
             dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
         )
+        if logger.isEnabledFor(logging.INFO):
+            src_ids = list(getattr(src_spec, "block_ids", []))
+            pos = 0
+            summary = []
+            for gi, gsize in enumerate(group_sizes):
+                if gsize:
+                    summary.append(
+                        (
+                            gi,
+                            gsize,
+                            block_indices[gi],
+                            src_ids[pos : pos + gsize][:2],
+                            dst_block_ids[pos : pos + gsize][:2],
+                        )
+                    )
+                pos += gsize
+            logger.info(
+                "OFFLOAD-LOADMAP req=%s ext=%d groups=%s",
+                request.request_id,
+                num_external_tokens,
+                summary,
+            )
 
         load_job_id = self._generate_job_id()
         self._current_batch_load_jobs[load_job_id] = TransferJob(
@@ -967,6 +1034,28 @@ class OffloadingConnectorScheduler:
                 src_block_ids, group_sizes=group_sizes, block_indices=block_indices
             )
             dst_spec = store_output.store_spec
+            if logger.isEnabledFor(logging.INFO):
+                dst_ids = list(getattr(dst_spec, "block_ids", []))
+                pos = 0
+                summary = []
+                for gi, gsize in enumerate(group_sizes):
+                    if gsize:
+                        summary.append(
+                            (
+                                gi,
+                                gsize,
+                                block_indices[gi],
+                                src_block_ids[pos : pos + gsize][:2],
+                                dst_ids[pos : pos + gsize][:2],
+                            )
+                        )
+                    pos += gsize
+                logger.info(
+                    "OFFLOAD-STOREMAP req=%s upto=%d groups=%s",
+                    req_id,
+                    num_offloadable_tokens,
+                    summary,
+                )
 
             job_id = self._generate_job_id()
             # a store can only be issued when no load is pending.
@@ -1151,6 +1240,17 @@ class OffloadingConnectorScheduler:
                     src_block_ids.append(block_id)
                     group_sizes[group_idx] = 1
                     block_indices[group_idx] = gpu_block_idx
+                if logger.isEnabledFor(logging.INFO):
+                    logger.info(
+                        "OFFLOAD-BSTMAP req=%s boundary=%d groups=%s",
+                        req_id,
+                        boundary_tokens,
+                        [
+                            (gi, block_indices[gi])
+                            for gi, gsize in enumerate(group_sizes)
+                            if gsize
+                        ],
+                    )
 
                 job_id = self._generate_job_id()
                 req_status.transfer_jobs.add(job_id)
