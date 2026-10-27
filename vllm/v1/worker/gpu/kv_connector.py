@@ -32,6 +32,9 @@ class KVConnector:
     def pre_forward(self, scheduler_output: "SchedulerOutput") -> None:
         pass
 
+    def load_early(self, scheduler_output: "SchedulerOutput") -> None:
+        pass
+
     def post_forward(
         self, finished_req_ids: set[str], wait_for_save: bool = True
     ) -> KVConnectorOutput | None:
@@ -73,6 +76,25 @@ class ActiveKVConnector(KVConnector):
         else:
             with set_forward_context(None, self.vllm_config):
                 self.kv_connector.start_load_kv(get_forward_context())
+
+    def load_early(self, scheduler_output: "SchedulerOutput") -> None:
+        """Restore host-tier blocks before the model reads them.
+
+        The hybrid Mamba preprocess copies recurrent state out of its boundary
+        block before ``pre_forward()`` runs ``start_load_kv()``. A restore that
+        writes that block therefore has to be submitted earlier, otherwise the
+        copy carries an uninitialised state into the working block.
+        """
+        if self._disabled:
+            return
+        kv_connector_metadata = scheduler_output.kv_connector_metadata
+        if kv_connector_metadata is None:
+            return
+        # bind() happens again inside pre_forward(); the worker keys its
+        # submitted loads on the metadata object itself, so rebinding the same
+        # object does not re-issue them.
+        self.kv_connector.bind_connector_metadata(kv_connector_metadata)
+        self.kv_connector.load_host_tier_state_early()
 
     def post_forward(
         self, finished_req_ids: set[str], wait_for_save: bool = True

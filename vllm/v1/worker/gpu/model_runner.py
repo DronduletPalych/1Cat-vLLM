@@ -1536,6 +1536,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         early_model_inputs: dict[str, Any] | None = None
         ple_prepared = False
         if not dummy_run:
+            # Host-tier restores have to be resident before the hybrid Mamba
+            # preprocess copies the recurrent state that they carry.
+            self.kv_connector.load_early(scheduler_output)
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
