@@ -265,6 +265,16 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             c.bind_connector_metadata(cm)
         super().bind_connector_metadata(connector_metadata)
 
+    def load_host_tier_state_early(self) -> None:
+        """Forward the early-load hook to the connectors that restore state.
+
+        Without this the base no-op runs instead and a connector that has to
+        write Mamba boundary state before the forward pass never gets the
+        chance when it is registered behind MultiConnector.
+        """
+        for c in self._connectors:
+            c.load_host_tier_state_early()
+
     def clear_connector_metadata(self) -> None:
         for c in self._connectors:
             c.clear_connector_metadata()
