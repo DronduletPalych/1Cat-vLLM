@@ -170,6 +170,23 @@ class CPUOffloadingSpec(OffloadingSpec):
             block_size = mamba_spec.block_size * self.block_size_factor
             alignment_tokens = block_size
 
+            # Slots are per group, and a group whose offloaded block is finer
+            # than the alignment grid stores more blocks per token range: the
+            # sliding-window group holds one block per `alignment // block`
+            # token blocks. Uniform slot counts under-provision those groups by
+            # exactly that ratio, so their LRU evicts a prefix that the coarser
+            # groups still hold and a restore misses a whole request on a group
+            # whose data was never the same size.
+            group_block_sizes: dict[int, int] = {
+                i: kv_cache_config.kv_cache_groups[i].kv_cache_spec.block_size
+                * self.block_size_factor
+                for i in self.cpu_group_page_sizes
+            }
+
+            def token_slots(group_idx: int, num_token_blocks: int) -> int:
+                ratio = max(1, alignment_tokens // group_block_sizes[group_idx])
+                return num_token_blocks * ratio
+
             def state_slots(num_token_blocks: int) -> int:
                 return mamba_state_slots(
                     num_token_blocks,
@@ -182,7 +199,11 @@ class CPUOffloadingSpec(OffloadingSpec):
 
             def bytes_per_worker(num_token_blocks: int) -> int:
                 return (
-                    num_token_blocks * token_page
+                    sum(
+                        token_slots(i, num_token_blocks) * page
+                        for i, page in self.cpu_group_page_sizes.items()
+                        if i not in mamba_groups
+                    )
                     + state_slots(num_token_blocks) * state_page
                 )
 
@@ -200,7 +221,9 @@ class CPUOffloadingSpec(OffloadingSpec):
             self.num_blocks = num_blocks
             for i in self.cpu_group_page_sizes:
                 self.cpu_group_num_blocks[i] = (
-                    state_slots(num_blocks) if i in mamba_groups else num_blocks
+                    state_slots(num_blocks)
+                    if i in mamba_groups
+                    else token_slots(i, num_blocks)
                 )
             logger.info(
                 "Grouped CPU offload pool: %d token slots, %d state slots per "
@@ -215,6 +238,14 @@ class CPUOffloadingSpec(OffloadingSpec):
                 budget_per_worker,
                 self.retention_interval,
                 self.state_slots_reference_tokens,
+            )
+            logger.info(
+                "Grouped CPU offload per-group pages=%s slots=%s "
+                "block_sizes=%s alignment=%d",
+                {i: p for i, p in sorted(self.cpu_group_page_sizes.items())},
+                {i: n for i, n in sorted(self.cpu_group_num_blocks.items())},
+                {i: s for i, s in sorted(group_block_sizes.items())},
+                alignment_tokens,
             )
         else:
             total_gpu_kv_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
