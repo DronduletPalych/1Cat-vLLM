@@ -920,6 +920,9 @@ def preprocess_mamba(
     Copy the mamba state of previous step to the last
     (1 + num_speculative_blocks) block.
     """
+    _debug_mamba_align(
+        "enter", num_reqs=len(input_batch.req_ids), mode=cache_config.mamba_cache_mode
+    )
     mamba_group_ids = copy_bufs.mamba_group_ids
     mamba_spec = copy_bufs.mamba_spec
     num_speculative_blocks = mamba_spec.num_speculative_blocks
@@ -1138,11 +1141,24 @@ def preprocess_mamba_all_specdec(
     mamba_state_idx: dict[str, int],
     num_reqs: int,
     prev_last_scheduled_idx_buf: CpuGpuBuffer,
+    requests: dict[str, "CachedRequestState"] | None = None,
+    block_size: int | None = None,
 ) -> None:
     cleanup_mamba_state_idx(scheduler_output, mamba_state_idx)
     np_view = prev_last_scheduled_idx_buf.np
     for i, req_id in enumerate(input_batch.req_ids[:num_reqs]):
-        np_view[i] = mamba_state_idx.get(req_id, -1)
+        idx = mamba_state_idx.get(req_id)
+        if idx is None and requests is not None and block_size:
+            req_state = requests.get(req_id)
+            if req_state is not None and req_state.num_computed_tokens > 0:
+                # Resumed request (preempted, or a prefix restored from the
+                # host tier): the state it continues from lives in the block
+                # that covers its last computed token. Leaving -1 here makes
+                # the align kernel read block_table[-1], so the working block
+                # gets no state and the request decodes from garbage.
+                idx = (req_state.num_computed_tokens - 1) // block_size
+                mamba_state_idx[req_id] = idx
+        np_view[i] = -1 if idx is None else idx
     np_view[num_reqs:].fill(-1)
     prev_last_scheduled_idx_buf.copy_to_gpu()
 
