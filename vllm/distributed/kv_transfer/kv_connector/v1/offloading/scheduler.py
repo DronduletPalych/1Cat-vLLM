@@ -62,6 +62,14 @@ class TransferJobStatus:
 
 
 _DBG_LOOKUP = os.environ.get("VLLM_OFFLOAD_DEBUG_LOOKUP", "0") == "1"
+# Diagnostic only: comma separated KV group indices whose host-tier load is
+# skipped while the lookup still reports the prefix as a hit. Used to tell a
+# broken restored KV from a broken restored Mamba state.
+_DBG_SKIP_LOAD = {
+    int(part)
+    for part in os.environ.get("VLLM_OFFLOAD_DBG_SKIP_LOAD", "").split(",")
+    if part.strip().isdigit()
+}
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -756,6 +764,14 @@ class OffloadingConnectorScheduler:
         block_indices: list[int] = [0] * self.config.num_kv_cache_groups
         for group_config in self.config.kv_group_configs:
             group_state = req_status.group_states[group_config.group_idx]
+            if group_config.group_idx in _DBG_SKIP_LOAD:
+                logger.warning(
+                    "OFFLOAD-DBG-SKIP-LOAD req=%s group=%d skipped on request "
+                    "of the debug switch",
+                    request.request_id,
+                    group_config.group_idx,
+                )
+                continue
             group_blocks = blocks.blocks[group_config.group_idx]
             gpu_block_size = group_config.gpu_block_size
             offloaded_block_size = group_config.offloaded_block_size
@@ -1251,13 +1267,19 @@ class OffloadingConnectorScheduler:
                     if _DBG_LOOKUP:
                         logger.info(
                             "OFFLOAD-DBGSTORE req=%s g=%d boundary=%d idx=%d "
-                            "nkeys=%d key=%s",
+                            "nkeys=%d key=%s computed=%d sched=%d offloadable=%d "
+                            "prompt=%d ntok=%d",
                             req_id,
                             group_idx,
                             boundary_tokens,
                             offload_block_idx,
                             len(group_state.offload_keys),
                             offload_key[:8].hex(),
+                            req.num_computed_tokens,
+                            num_scheduled_tokens,
+                            num_offloadable_tokens,
+                            req.num_prompt_tokens,
+                            req.num_tokens,
                         )
                     keys.append(offload_key)
                     key_info[offload_key] = (

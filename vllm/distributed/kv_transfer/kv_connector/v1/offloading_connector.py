@@ -6,6 +6,7 @@ from typing import Any
 import torch
 
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
@@ -44,6 +45,8 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
 
+logger = init_logger(__name__)
+
 class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransfers):
     """Native CPU KV offload connector.
 
@@ -69,21 +72,10 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransf
 
         self.connector_scheduler: OffloadingConnectorScheduler | None = None
         self.connector_worker: OffloadingConnectorWorker | None = None
-        # A host-tier load is submitted at most once per metadata object:
-        # load_host_tier_state_early() may run before start_load_kv().
-        self._loads_started = False
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler = OffloadingConnectorScheduler(spec)
         elif role == KVConnectorRole.WORKER:
             self.connector_worker = OffloadingConnectorWorker(spec)
-
-    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
-        if connector_metadata is not self._connector_metadata:
-            # New step's metadata: the early load hook may submit again.
-            # Re-binding the same object must keep the flag, because
-            # load_host_tier_state_early() already submitted its jobs.
-            self._loads_started = False
-        super().bind_connector_metadata(connector_metadata)
 
     def shutdown(self) -> None:
         if self.connector_worker is not None:
@@ -109,11 +101,7 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransf
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, OffloadingConnectorMetadata)
-        if self._loads_started:
-            # Already submitted by load_host_tier_state_early().
-            return
         self.connector_worker.start_kv_transfers(self._connector_metadata)
-        self._loads_started = True
 
     def load_host_tier_state_early(self) -> None:
         """Make host-tier loads resident before the model reads them.
@@ -127,10 +115,15 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransf
             return
         if not isinstance(self._connector_metadata, OffloadingConnectorMetadata):
             return
-        if self._loads_started:
+        if not self._connector_metadata.load_jobs:
             return
-        self.connector_worker.start_kv_transfers(self._connector_metadata)
-        self._loads_started = True
+        logger.warning(
+            "OFFLOAD-EARLY-LOAD %d load job(s) submitted before the forward",
+            len(self._connector_metadata.load_jobs),
+        )
+        self.connector_worker.start_kv_transfers(
+            self._connector_metadata, loads_only=True
+        )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass

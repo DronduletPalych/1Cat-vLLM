@@ -4867,12 +4867,15 @@ class GPUModelRunner(
             self.spec_state_slot_selectors.gpu.fill_(1)
 
         if self.mamba_prev_last_scheduled_idx is not None:
+            _, _mamba_spec = mamba_utils.get_mamba_groups(self.kv_cache_config)
             mamba_utils.preprocess_mamba_all_specdec(
                 scheduler_output,
                 self.input_batch,
                 self.mamba_state_idx,
                 num_reqs,
                 self.mamba_prev_last_scheduled_idx,
+                self.requests,
+                _mamba_spec.block_size,
             )
         if profile_inputs:
             profile_state_sync_ms = (time.perf_counter() - profile_stage_t0) * 1000.0
@@ -8372,6 +8375,23 @@ class GPUModelRunner(
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
+            # A host-tier restore writes blocks the model reads before the
+            # forward pass: the Mamba boundary state that preprocess_mamba
+            # copies out of, and the state spec-decode compaction touches.
+            # The connector normally binds and loads inside
+            # maybe_get_kv_connector_output(), which runs later, so bind and
+            # load here first. start_load_kv() is idempotent per metadata.
+            if (
+                self.cache_config.mamba_cache_mode == "align"
+                and scheduler_output.kv_connector_metadata is not None
+                and has_kv_transfer_group()
+            ):
+                kv_connector_early = get_kv_transfer_group()
+                kv_connector_early.bind_connector_metadata(
+                    scheduler_output.kv_connector_metadata
+                )
+                kv_connector_early.load_host_tier_state_early()
+
             trace_prepare_inputs_t0 = time.perf_counter() if trace_log else 0.0
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
@@ -8456,22 +8476,6 @@ class GPUModelRunner(
             pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
             if self.cache_config.mamba_cache_mode == "align":
-                # A host-tier restore writes the Mamba boundary state block
-                # that preprocess_mamba is about to copy out of. The connector
-                # normally binds and loads inside maybe_get_kv_connector_output(),
-                # which runs after this block, so without this the copy carries
-                # an uninitialised state into the working block and the request
-                # decodes from garbage. start_load_kv() stays a no-op later.
-                if (
-                    scheduler_output.kv_connector_metadata is not None
-                    and has_kv_transfer_group()
-                ):
-                    kv_connector_early = get_kv_transfer_group()
-                    kv_connector_early.bind_connector_metadata(
-                        scheduler_output.kv_connector_metadata
-                    )
-                    kv_connector_early.load_host_tier_state_early()
-
                 trace_mamba_t0 = time.perf_counter() if trace_log else 0.0
                 # preprocess_mamba reads req_state.num_computed_tokens (CPU)
                 # to decide copy operations, so we must apply deferred
