@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import logging
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import islice
@@ -338,19 +337,6 @@ class OffloadingConnectorScheduler:
 
     def __init__(self, spec: OffloadingSpec):
         self.config = SchedulerOffloadConfig.from_spec(spec)
-        # A spec-decoding draft writes unverified tokens into the trailing
-        # block. The core drops that block from prefix-cache hits for groups it
-        # knows are EAGLE/MTP groups, but DFlash draft groups are never
-        # annotated (upstream issue #57032), so the host tier would serve the
-        # unverified block back as a hit and the target would generate from a
-        # state the verifier never accepted. Withhold the trailing block here.
-        self._drop_last_prefix_block = (
-            getattr(spec.vllm_config, "speculative_config", None) is not None
-        )
-        self._hit_block_tokens = max(
-            (g.offloaded_block_size for g in self.config.kv_group_configs),
-            default=0,
-        )
         self._group_config_by_idx = {
             group.group_idx: group for group in self.config.kv_group_configs
         }
@@ -621,11 +607,6 @@ class OffloadingConnectorScheduler:
                     )
                     return 0
 
-        if self._drop_last_prefix_block and num_hit_tokens > 0:
-            # Never take the trailing block back from the host tier while a
-            # draft model may have written unverified tokens into it.
-            num_hit_tokens = max(0, num_hit_tokens - self._hit_block_tokens)
-
         logger.debug(
             "Request %s hit %s offloaded tokens after %s GPU hit tokens",
             req_status.req.request_id,
@@ -813,28 +794,6 @@ class OffloadingConnectorScheduler:
         dst_spec = GPULoadStoreSpec(
             dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
         )
-        if logger.isEnabledFor(logging.INFO):
-            src_ids = list(getattr(src_spec, "block_ids", []))
-            pos = 0
-            summary = []
-            for gi, gsize in enumerate(group_sizes):
-                if gsize:
-                    summary.append(
-                        (
-                            gi,
-                            gsize,
-                            block_indices[gi],
-                            src_ids[pos : pos + gsize][:2],
-                            dst_block_ids[pos : pos + gsize][:2],
-                        )
-                    )
-                pos += gsize
-            logger.info(
-                "OFFLOAD-LOADMAP req=%s ext=%d groups=%s",
-                request.request_id,
-                num_external_tokens,
-                summary,
-            )
 
         load_job_id = self._generate_job_id()
         self._current_batch_load_jobs[load_job_id] = TransferJob(
@@ -1034,29 +993,6 @@ class OffloadingConnectorScheduler:
                 src_block_ids, group_sizes=group_sizes, block_indices=block_indices
             )
             dst_spec = store_output.store_spec
-            if logger.isEnabledFor(logging.INFO):
-                dst_ids = list(getattr(dst_spec, "block_ids", []))
-                pos = 0
-                summary = []
-                for gi, gsize in enumerate(group_sizes):
-                    if gsize:
-                        summary.append(
-                            (
-                                gi,
-                                gsize,
-                                block_indices[gi],
-                                src_block_ids[pos : pos + gsize][:2],
-                                dst_ids[pos : pos + gsize][:2],
-                            )
-                        )
-                    pos += gsize
-                logger.info(
-                    "OFFLOAD-STOREMAP req=%s upto=%d groups=%s",
-                    req_id,
-                    num_offloadable_tokens,
-                    summary,
-                )
-
             job_id = self._generate_job_id()
             # a store can only be issued when no load is pending.
             if req_status.transfer_jobs:
@@ -1240,39 +1176,7 @@ class OffloadingConnectorScheduler:
                     src_block_ids.append(block_id)
                     group_sizes[group_idx] = 1
                     block_indices[group_idx] = gpu_block_idx
-                if logger.isEnabledFor(logging.INFO):
-                    logger.info(
-                        "OFFLOAD-BSTMAP req=%s boundary=%d groups=%s",
-                        req_id,
-                        boundary_tokens,
-                        [
-                            (gi, block_indices[gi])
-                            for gi, gsize in enumerate(group_sizes)
-                            if gsize
-                        ],
-                    )
-
-                job_id = self._generate_job_id()
-                req_status.transfer_jobs.add(job_id)
-                for bid in src_block_ids:
-                    self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
-                self._jobs[job_id] = TransferJobStatus(
-                    req_id=req_id,
-                    pending_count=self.config.num_workers,
-                    keys=keys_to_store,
-                    is_store=True,
-                    sliding_window_block_ids=src_block_ids,
-                )
-                src_spec = GPULoadStoreSpec(
-                    src_block_ids,
-                    group_sizes=group_sizes,
-                    block_indices=block_indices,
-                )
-                store_jobs[job_id] = TransferJob(
-                    req_id=req_id,
-                    transfer_spec=(src_spec, store_output.store_spec),
-                )
-            req_status.pending_boundary_offloads = still_pending
+                req_status.pending_boundary_offloads = still_pending
 
         return store_jobs
 
