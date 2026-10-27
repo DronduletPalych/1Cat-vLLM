@@ -86,17 +86,36 @@ class CPUOffloadingSpec(OffloadingSpec):
                 spec = next(iter(spec.kv_cache_specs.values()))
             if isinstance(spec, MambaSpec):
                 mamba_specs[i] = spec
-        # Equal-sized Mamba/attention blocks need matching checkpoint coverage.
-        # Keep the existing layout for single groups and mixed block geometry.
+        # Per-group pools are what keep CPU pages private to a KV group. A
+        # hybrid model mixes mamba block geometry with attention blocks
+        # (512 vs 1024 here); the shared-page layout then has no per-group
+        # byte offset inside a page, so every group writes its state at the
+        # start of the same page and the last writer wins. Mixed geometry is
+        # therefore a reason to partition, never a reason to share.
+        _grouped_env = os.environ.get("VLLM_CPU_OFFLOAD_GROUPED", "1") != "0"
+        _block_sizes = {self.gpu_block_size[i] for i in cacheable_groups}
         self.partition_by_group = (
             kv_cache_config.num_blocks > 0
             and len(cacheable_groups) > 1
             and bool(mamba_specs)
-            and len({self.gpu_block_size[i] for i in cacheable_groups}) == 1
             # Escape hatch: one shared page per token block is the layout that
             # predates per-group pools, and the only one validated end to end
             # for restore correctness.
-            and os.environ.get("VLLM_CPU_OFFLOAD_GROUPED", "1") != "0"
+            and _grouped_env
+        )
+        logger.info(
+            "OFFLOAD-LAYOUT partition_by_group=%s num_blocks=%d groups=%d "
+            "mamba_groups=%s block_sizes=%s env=%s spec_types=%s",
+            self.partition_by_group,
+            kv_cache_config.num_blocks,
+            len(cacheable_groups),
+            sorted(mamba_specs),
+            sorted(_block_sizes),
+            _grouped_env,
+            [
+                type(g.kv_cache_spec).__name__
+                for g in kv_cache_config.kv_cache_groups
+            ],
         )
         # Mamba state slots follow the prefix-cache retention policy (see
         # CacheConfig.prefix_cache_retention_interval): sparse retention keeps
