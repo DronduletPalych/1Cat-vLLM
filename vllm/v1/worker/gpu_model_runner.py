@@ -8381,9 +8381,10 @@ class GPUModelRunner(
             # The connector normally binds and loads inside
             # maybe_get_kv_connector_output(), which runs later, so bind and
             # load here first. start_load_kv() is idempotent per metadata.
+            # Not gated on the mamba cache mode: the runner that first reaches
+            # a step is not always the one holding the model's own mode.
             if (
-                self.cache_config.mamba_cache_mode == "align"
-                and scheduler_output.kv_connector_metadata is not None
+                scheduler_output.kv_connector_metadata is not None
                 and has_kv_transfer_group()
             ):
                 kv_connector_early = get_kv_transfer_group()
