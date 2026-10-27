@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterator
 
 from vllm.config import VllmConfig
@@ -92,6 +93,10 @@ class CPUOffloadingSpec(OffloadingSpec):
             and len(cacheable_groups) > 1
             and bool(mamba_specs)
             and len({self.gpu_block_size[i] for i in cacheable_groups}) == 1
+            # Escape hatch: one shared page per token block is the layout that
+            # predates per-group pools, and the only one validated end to end
+            # for restore correctness.
+            and os.environ.get("VLLM_CPU_OFFLOAD_GROUPED", "1") != "0"
         )
         # Mamba state slots follow the prefix-cache retention policy (see
         # CacheConfig.prefix_cache_retention_interval): sparse retention keeps
