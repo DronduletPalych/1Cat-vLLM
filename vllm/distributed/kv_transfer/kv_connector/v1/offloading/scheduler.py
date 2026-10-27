@@ -3,6 +3,7 @@
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import islice
+import os
 from typing import Any, NamedTuple
 
 from vllm.distributed.kv_events import BlockRemoved, BlockStored, KVCacheEvent
@@ -58,6 +59,9 @@ class TransferJobStatus:
     # Store src block IDs that may be freed before the request finishes.
     # Registered in _block_id_to_pending_jobs at store creation time.
     sliding_window_block_ids: list[int] | None = None
+
+
+_DBG_LOOKUP = os.environ.get("VLLM_OFFLOAD_DEBUG_LOOKUP", "0") == "1"
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -363,6 +367,25 @@ class OffloadingConnectorScheduler:
         self._lookup_groups = tuple(full_attention_groups) + self._sliding_window_groups
         self._mamba_align_size: int | None = resolve_mamba_align_size(spec)
 
+        if _DBG_LOOKUP:
+            logger.info(
+                "OFFLOAD-CFG block_size_factor=%d mamba_align=%s groups=%s",
+                self.config.block_size_factor,
+                self._mamba_align_size,
+                [
+                    (
+                        c.group_idx,
+                        c.gpu_block_size,
+                        c.offloaded_block_size,
+                        c.hash_block_size_factor,
+                        c.sliding_window_size_in_blocks,
+                        c.alignment_block_count,
+                        int(c.requires_exact_boundary_source),
+                    )
+                    for c in self.config.kv_group_configs
+                ],
+            )
+
         self._req_status: dict[ReqId, RequestOffloadState] = {}
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
         self._current_batch_jobs_to_flush: set[int] = set()
@@ -505,6 +528,17 @@ class OffloadingConnectorScheduler:
                 )
 
                 # Constrain to block-aligned boundary for this group
+                if _DBG_LOOKUP:
+                    logger.info(
+                        "OFFLOAD-DBGENTRY req=%s g=%d ntokens=%d ncomputed=%d "
+                        "nkeys=%d max_hit=%d",
+                        req_status.req.request_id,
+                        group_idx,
+                        req_status.req.num_tokens,
+                        num_computed_tokens,
+                        len(offload_keys),
+                        max_hit_size_tokens,
+                    )
                 max_hit_size_tokens = min(
                     max_hit_size_tokens, len(offload_keys) * offloaded_block_size
                 )
@@ -534,9 +568,28 @@ class OffloadingConnectorScheduler:
                         sliding_window_size_in_blocks,
                         req_status.req_context,
                     )
+                if _DBG_LOOKUP:
+                    full_keys = group_state.offload_keys
+                    present = [
+                        i for i, k in enumerate(full_keys) if self.manager.contains(k)
+                    ]
+                    logger.info(
+                        "OFFLOAD-LOOK-DBG req=%s g=%d sw=%s obsize=%d nkeys=%d "
+                        "span=[%d,%d) hit=%s present=%d present_tail=%s tail=%s",
+                        req_status.req.request_id,
+                        group_idx,
+                        sliding_window_size_in_blocks,
+                        offloaded_block_size,
+                        len(full_keys),
+                        start_block_idx,
+                        num_blocks,
+                        num_hit_blocks,
+                        len(present),
+                        present[-6:],
+                        [k[:6].hex() for k in offload_keys[-4:]],
+                    )
                 if num_hit_blocks == 0:
                     return 0
-
                 if num_hit_blocks is None:
                     defer_lookup = True
                 else:
@@ -873,9 +926,11 @@ class OffloadingConnectorScheduler:
             # Filter out blocks skipped due to sliding window attention / SSM
             # or unreachable by the load path's alignment constraints.
             new_offload_keys: list[OffloadKey] = []
+            dbg_groups: dict[int, dict] = {}
             for group_config in self.config.kv_group_configs:
                 group_state = req_status.group_states[group_config.group_idx]
                 if group_config.requires_exact_boundary_source:
+                    dbg_groups[group_config.group_idx] = {"exact": 1}
                     continue
                 num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
                 # A preempted request loses blocks before its hashes are
@@ -888,6 +943,11 @@ class OffloadingConnectorScheduler:
                 )
                 start_block_idx = group_state.next_stored_block_idx
                 if num_blocks <= start_block_idx:
+                    dbg_groups[group_config.group_idx] = {
+                        "num": num_blocks,
+                        "start": start_block_idx,
+                        "kept": 0,
+                    }
                     continue
                 offload_keys = group_state.offload_keys[start_block_idx:num_blocks]
                 # For each block to offload, take the last corresponding GPU block.
@@ -907,11 +967,13 @@ class OffloadingConnectorScheduler:
 
                 alignment_block_count = group_config.alignment_block_count
                 tail = group_config.sliding_window_size_in_blocks
+                dbg_zero = dbg_align = dbg_kept = 0
 
                 for key_idx, (offload_key, block_id) in enumerate(
                     zip(offload_keys, offload_block_ids)
                 ):
                     if block_id == 0:
+                        dbg_zero += 1
                         continue
                     # Skip SWA blocks that can never serve a load hit:
                     # within each full-attention alignment segment, only the
@@ -923,10 +985,28 @@ class OffloadingConnectorScheduler:
                         abs_block_idx = start_block_idx + key_idx
                         pos_in_segment = abs_block_idx % alignment_block_count
                         if pos_in_segment < alignment_block_count - tail:
+                            dbg_align += 1
                             continue
                     new_offload_keys.append(offload_key)
+                    dbg_kept += 1
+
+                dbg_groups[group_config.group_idx] = {
+                    "num": num_blocks,
+                    "start": start_block_idx,
+                    "cand": len(offload_keys),
+                    "zero": dbg_zero,
+                    "align": dbg_align,
+                    "kept": dbg_kept,
+                }
 
             if not new_offload_keys:
+                if _DBG_LOOKUP:
+                    logger.info(
+                        "OFFLOAD-STORE-SKIP req=%s tokens=%d groups=%s",
+                        req_id,
+                        num_offloadable_tokens,
+                        sorted(dbg_groups.items()),
+                    )
                 req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
 
@@ -938,6 +1018,14 @@ class OffloadingConnectorScheduler:
                 continue
 
             if not store_output.keys_to_store:
+                if _DBG_LOOKUP:
+                    logger.info(
+                        "OFFLOAD-STORE-NOKEYS req=%s tokens=%d cand=%d groups=%s",
+                        req_id,
+                        num_offloadable_tokens,
+                        len(new_offload_keys),
+                        sorted(dbg_groups.items()),
+                    )
                 req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
 
@@ -962,11 +1050,13 @@ class OffloadingConnectorScheduler:
                 block_ids = group_state.block_ids
                 num_group_blocks = 0
                 start_gpu_block_idx: int | None = None
+                dbg_keys: list[OffloadKey] = []
                 for idx, offload_key in enumerate(
                     group_state.offload_keys[start_block_idx:num_blocks]
                 ):
                     if offload_key not in keys_to_store:
                         continue
+                    dbg_keys.append(offload_key)
 
                     offloaded_block_idx = start_block_idx + idx
                     gpu_block_idx = offloaded_block_idx * block_size_factor
@@ -988,12 +1078,27 @@ class OffloadingConnectorScheduler:
                 group_sizes[group_config.group_idx] = num_group_blocks
                 block_indices[group_config.group_idx] = start_gpu_block_idx or 0
                 group_state.next_stored_block_idx = num_blocks
+                if _DBG_LOOKUP:
+                    dbg_groups.setdefault(group_config.group_idx, {}).update(
+                        stored=num_group_blocks,
+                        keys=len(dbg_keys),
+                        first=dbg_keys[0][:6].hex() if dbg_keys else "-",
+                        last=dbg_keys[-1][:6].hex() if dbg_keys else "-",
+                    )
 
             src_spec = GPULoadStoreSpec(
                 src_block_ids, group_sizes=group_sizes, block_indices=block_indices
             )
             dst_spec = store_output.store_spec
             job_id = self._generate_job_id()
+            if _DBG_LOOKUP:
+                logger.info(
+                    "OFFLOAD-STORE-DBG req=%s job=%d tokens=%d groups=%s",
+                    req_id,
+                    job_id,
+                    num_offloadable_tokens,
+                    sorted(dbg_groups.items()),
+                )
             # a store can only be issued when no load is pending.
             if req_status.transfer_jobs:
                 any_jid = next(iter(req_status.transfer_jobs))
@@ -1143,6 +1248,17 @@ class OffloadingConnectorScheduler:
                     if offload_block_idx >= len(group_state.offload_keys):
                         continue
                     offload_key = group_state.offload_keys[offload_block_idx]
+                    if _DBG_LOOKUP:
+                        logger.info(
+                            "OFFLOAD-DBGSTORE req=%s g=%d boundary=%d idx=%d "
+                            "nkeys=%d key=%s",
+                            req_id,
+                            group_idx,
+                            boundary_tokens,
+                            offload_block_idx,
+                            len(group_state.offload_keys),
+                            offload_key[:8].hex(),
+                        )
                     keys.append(offload_key)
                     key_info[offload_key] = (
                         group_idx,
@@ -1165,6 +1281,8 @@ class OffloadingConnectorScheduler:
                     continue
                 keys_to_store = set(store_output.keys_to_store)
                 if not keys_to_store:
+                    # Every key is already in the tier (an identical prefix was
+                    # stored before). Nothing to transfer and nothing to retry.
                     continue
 
                 ordered_keys = [k for k in keys if k in keys_to_store]
@@ -1176,7 +1294,28 @@ class OffloadingConnectorScheduler:
                     src_block_ids.append(block_id)
                     group_sizes[group_idx] = 1
                     block_indices[group_idx] = gpu_block_idx
-                req_status.pending_boundary_offloads = still_pending
+
+                job_id = self._generate_job_id()
+                req_status.transfer_jobs.add(job_id)
+                for bid in src_block_ids:
+                    self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
+                self._jobs[job_id] = TransferJobStatus(
+                    req_id=req_id,
+                    pending_count=self.config.num_workers,
+                    keys=keys_to_store,
+                    is_store=True,
+                    sliding_window_block_ids=src_block_ids,
+                )
+                src_spec = GPULoadStoreSpec(
+                    src_block_ids,
+                    group_sizes=group_sizes,
+                    block_indices=block_indices,
+                )
+                store_jobs[job_id] = TransferJob(
+                    req_id=req_id,
+                    transfer_spec=(src_spec, store_output.store_spec),
+                )
+            req_status.pending_boundary_offloads = still_pending
 
         return store_jobs
 

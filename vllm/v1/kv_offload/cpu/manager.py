@@ -159,6 +159,10 @@ class CPUOffloadingManager(OffloadingManager):
             blocks.append(block)
         return self._get_load_store_spec(keys, blocks)
 
+    def contains(self, key: OffloadKey) -> bool:
+        """Read-only membership test. Diagnostics only: no LRU touch."""
+        return self._policy.get(key) is not None
+
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
         self._policy.touch(keys)
 
@@ -450,6 +454,10 @@ class GroupedCPUOffloadingManager(OffloadingManager):
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
         return self.managers[get_offload_group_idx(key)].lookup(key, req_context)
+
+    def contains(self, key: OffloadKey) -> bool:
+        manager = self.managers.get(get_offload_group_idx(key))
+        return False if manager is None else manager.contains(key)
 
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
         for group_idx, group_keys in self._partition(keys).items():

@@ -140,6 +140,14 @@ class OffloadingManager(ABC):
         """
         pass
 
+    def contains(self, key: OffloadKey) -> bool:
+        """Read-only membership probe, used by diagnostics only.
+
+        Backends without a queryable index return False; the value is never
+        consulted outside debug logging.
+        """
+        return False
+
     @abstractmethod
     def prepare_load(
         self,
