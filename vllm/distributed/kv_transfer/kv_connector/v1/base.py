@@ -243,6 +243,16 @@ class KVConnectorBase_V1(ABC):
         """
         self._connector_metadata = None
 
+    def load_host_tier_state_early(self) -> None:
+        """Start connector loads that the model reads before its forward pass.
+
+        A connector that restores Mamba state blocks must have them resident
+        before the worker copies the recurrent state out of them, and that
+        copy runs before ``start_load_kv()``. Connectors that do not restore
+        such state keep the default no-op.
+        """
+        return
+
     def _get_connector_metadata(self) -> KVConnectorMetadata:
         """Get the connector metadata.
 
