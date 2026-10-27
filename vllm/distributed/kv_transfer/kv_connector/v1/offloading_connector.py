@@ -69,10 +69,21 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransf
 
         self.connector_scheduler: OffloadingConnectorScheduler | None = None
         self.connector_worker: OffloadingConnectorWorker | None = None
+        # A host-tier load is submitted at most once per metadata object:
+        # load_host_tier_state_early() may run before start_load_kv().
+        self._loads_started = False
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler = OffloadingConnectorScheduler(spec)
         elif role == KVConnectorRole.WORKER:
             self.connector_worker = OffloadingConnectorWorker(spec)
+
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+        if connector_metadata is not self._connector_metadata:
+            # New step's metadata: the early load hook may submit again.
+            # Re-binding the same object must keep the flag, because
+            # load_host_tier_state_early() already submitted its jobs.
+            self._loads_started = False
+        super().bind_connector_metadata(connector_metadata)
 
     def shutdown(self) -> None:
         if self.connector_worker is not None:
@@ -98,7 +109,28 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransf
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, OffloadingConnectorMetadata)
+        if self._loads_started:
+            # Already submitted by load_host_tier_state_early().
+            return
         self.connector_worker.start_kv_transfers(self._connector_metadata)
+        self._loads_started = True
+
+    def load_host_tier_state_early(self) -> None:
+        """Make host-tier loads resident before the model reads them.
+
+        The worker copies Mamba recurrent state out of its boundary block
+        before ``start_load_kv()`` runs. A restore that writes that block has
+        to happen first, otherwise the copy carries an uninitialised state
+        into the working block and the request decodes from garbage.
+        """
+        if self.connector_worker is None:
+            return
+        if not isinstance(self._connector_metadata, OffloadingConnectorMetadata):
+            return
+        if self._loads_started:
+            return
+        self.connector_worker.start_kv_transfers(self._connector_metadata)
+        self._loads_started = True
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass
