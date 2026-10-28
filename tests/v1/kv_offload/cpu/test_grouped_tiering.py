@@ -80,7 +80,13 @@ def _build(root):
     spec.extra_config = {}
     spec.persistent_layout = {"version": "test-grouped-row-v1"}
     spec.secondary_tier_configs = [
-        {"type": "fs", "root_dir": str(root), "n_read_threads": 1, "n_write_threads": 1}
+        {
+            "type": "fs",
+            "root_dir": str(root),
+            "max_bytes": 256 * 1024 * 1024,
+            "n_read_threads": 1,
+            "n_write_threads": 1,
+        }
     ]
     spec._manager = None
     return spec.get_manager()

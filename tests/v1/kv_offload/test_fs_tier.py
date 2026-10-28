@@ -105,6 +105,7 @@ def fs_tier(tmp_path):
         primary_kv_view=mock_view,
         tier_type="fs",
         root_dir=str(tmp_path),
+        max_bytes=256 * 1024 * 1024,
         n_read_threads=4,
         n_write_threads=4,
     )
@@ -165,7 +166,48 @@ def test_invalid_path_raises_at_construction():
             primary_kv_view=mock_view,
             tier_type="fs",
             root_dir="/dev/null/invalid_path",
+            max_bytes=256 * 1024 * 1024,
         )
+
+
+def test_missing_max_bytes_is_rejected(tmp_path):
+    """An unbounded filesystem cache is not allowed."""
+    tensor = torch.zeros((4, _BLOCK_ELEMENTS), dtype=_DTYPE)
+    mock_view = memoryview(tensor.numpy())
+
+    with pytest.raises(ValueError, match="max_bytes"):
+        FileSystemTierManager(
+            offloading_spec=_MOCK_OFFLOADING_SPEC,
+            primary_kv_view=mock_view,
+            tier_type="fs",
+            root_dir=str(tmp_path),
+        )
+
+
+def test_store_beyond_capacity_fails_the_job_and_reserves_nothing(tmp_path):
+    """When the tier cannot make room, the job fails instead of writing."""
+    tensor = torch.zeros((4, _BLOCK_ELEMENTS), dtype=_DTYPE)
+    mock_view = memoryview(tensor.numpy())
+    block_bytes = tensor.shape[1] * tensor.element_size()
+    tier = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=mock_view,
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        max_bytes=2 * block_bytes,
+        max_overshoot_bytes=0,
+        n_read_threads=2,
+        n_write_threads=2,
+    )
+    try:
+        tier.submit_store(make_job(1, [key(1), key(2), key(3)], [0, 1, 2]))
+        results = drain(tier)
+        assert len(results) == 1
+        assert not results[0].success
+        assert tier.stats()["fs_bytes_used"] == 0
+        assert tier.lookup(key(1), _CTX) is False
+    finally:
+        tier.shutdown()
 
 
 def test_failed_load_missing_file(fs_tier):
