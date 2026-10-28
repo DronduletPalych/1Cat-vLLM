@@ -4,6 +4,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import islice
 import os
+import time
 from typing import Any, NamedTuple
 
 from vllm.distributed.kv_events import BlockRemoved, BlockStored, KVCacheEvent
@@ -354,6 +355,15 @@ class OffloadingConnectorScheduler:
         }
         self.manager: OffloadingManager = spec.get_manager()
 
+        # Diagnostics for the "no deferred work" invariant (TZ §3.3). All
+        # counters live in the scheduler process, next to the tier managers.
+        self._defer_stats: dict[str, int] = {
+            "deferred_stores": 0,
+            "deferred_promotions": 0,
+            "store_cannot_proceed": 0,
+        }
+        self._defer_last_log = time.monotonic()
+
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
         for group_config in self.config.kv_group_configs:
@@ -631,6 +641,7 @@ class OffloadingConnectorScheduler:
                 num_hit_tokens = new_num_hit_tokens
 
         if defer_lookup:
+            self._defer_stats["deferred_promotions"] += 1
             logger.debug(
                 "Offloading manager delayed request %s as backend requested",
                 req_status.req.request_id,
@@ -900,6 +911,7 @@ class OffloadingConnectorScheduler:
             if req_status.transfer_jobs:
                 any_jid = next(iter(req_status.transfer_jobs))
                 if not self._jobs[any_jid].is_store:
+                    self._defer_stats["deferred_stores"] += 1
                     continue
 
             if preempted:
@@ -1030,6 +1042,7 @@ class OffloadingConnectorScheduler:
                 new_offload_keys, req_status.req_context
             )
             if store_output is None:
+                self._defer_stats["store_cannot_proceed"] += 1
                 logger.warning("Request %s: cannot store blocks", req_id)
                 continue
 
@@ -1221,6 +1234,7 @@ class OffloadingConnectorScheduler:
             if req_status.transfer_jobs:
                 any_jid = next(iter(req_status.transfer_jobs))
                 if not self._jobs[any_jid].is_store:
+                    self._defer_stats["deferred_stores"] += 1
                     continue
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
             num_offloadable_tokens = min(
@@ -1492,6 +1506,20 @@ class OffloadingConnectorScheduler:
         Returns:
             A list of KV cache events.
         """
+        now = time.monotonic()
+        if now - self._defer_last_log >= 10.0:
+            self._defer_last_log = now
+            pinned = sum(len(job.keys) for job in self._jobs.values())
+            st = self._defer_stats
+            logger.info(
+                "OFFLOAD-DEFER deferred_stores=%d deferred_promotions=%d "
+                "store_cannot_proceed=%d pinned_blocks=%d inflight_jobs=%d",
+                st["deferred_stores"],
+                st["deferred_promotions"],
+                st["store_cannot_proceed"],
+                pinned,
+                len(self._jobs),
+            )
         for event in self.manager.take_events():
             block_hashes = [get_offload_block_hash(key) for key in event.keys]
             if event.removed:
