@@ -7,6 +7,7 @@ from unittest import mock
 
 import torch
 
+from vllm import envs
 from vllm.config.sm70_moe import Sm70UnquantizedMoEConfig
 from vllm.v1.worker.gpu import kv_connector as mrv2_kv_connector
 from vllm.v1.worker.gpu import model_runner as mrv2
