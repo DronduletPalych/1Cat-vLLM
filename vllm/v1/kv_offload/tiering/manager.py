@@ -20,6 +20,8 @@ Key Design Principles:
    protecting blocks from eviction until complete_read() is called
 """
 
+import os
+import time
 from collections import defaultdict
 from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
@@ -47,6 +49,9 @@ from vllm.v1.kv_offload.tiering.base import (
 )
 
 logger = init_logger(__name__)
+
+# Optional tier-level hit/miss counters (env-gated diagnostics).
+_TIER_STATS = os.environ.get("VLLM_TIER_STATS") == "1"
 
 
 @dataclass
@@ -171,6 +176,20 @@ class TieringOffloadingManager(OffloadingManager):
             defaultdict(set)
         )
 
+        # Diagnostics: where lookups are answered from, and how many cascades
+        # to the secondary tiers failed.
+        self._stats: dict[str, int] = {
+            "primary_hit": 0,
+            "primary_inflight": 0,
+            "sec_lookup": 0,
+            "sec_hit": 0,
+            "promo_ok": 0,
+            "promo_fail": 0,
+            "miss": 0,
+            "store_failures": 0,
+        }
+        self._stats_last = time.monotonic()
+
     def _next_job_id(self) -> JobId:
         """Generate a unique job ID for async transfer tracking."""
         job_id = self._job_id_counter
@@ -220,10 +239,48 @@ class TieringOffloadingManager(OffloadingManager):
                     )
                 else:
                     # primary→secondary transfer completed.
-                    # Decrement ref_cnt on primary blocks.
+                    if not completed_job.success:
+                        # The cascade failed: nothing may be treated as stored
+                        # in the secondary tier. The file is absent (the store
+                        # path is atomic: tmp + rename) and the FS tier has
+                        # already released its capacity reservation, so
+                        # lookup() keeps reporting a miss for these keys.
+                        self._stats["store_failures"] += 1
+                        logger.warning(
+                            "OFFLOAD-STORE-FAIL tier=%s job=%s keys=%d "
+                            "store_failures=%d",
+                            tier.tier_type,
+                            job_id,
+                            len(job_metadata.keys),
+                            self._stats["store_failures"],
+                        )
+                    # Decrement ref_cnt on primary blocks (also on failure:
+                    # the slots must become evictable again).
                     self.primary_tier.complete_read(
                         job_metadata.keys, job_metadata.req_context
                     )
+
+    def _bump(self, name: str) -> None:
+        """Count a lookup outcome and log the running totals every 10 s."""
+        if not _TIER_STATS:
+            return
+        self._stats[name] += 1
+        now = time.monotonic()
+        if now - self._stats_last >= 10.0:
+            self._stats_last = now
+            st = self._stats
+            logger.info(
+                "TIER-STATS primary_hit=%d primary_inflight=%d sec_lookup=%d "
+                "sec_hit=%d promo_ok=%d promo_fail=%d miss=%d store_failures=%d",
+                st["primary_hit"],
+                st["primary_inflight"],
+                st["sec_lookup"],
+                st["sec_hit"],
+                st["promo_ok"],
+                st["promo_fail"],
+                st["miss"],
+                st["store_failures"],
+            )
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
         """
@@ -250,22 +307,29 @@ class TieringOffloadingManager(OffloadingManager):
 
         primary_hit = self.primary_tier.lookup(key, req_context)
         if primary_hit is True:
+            self._bump("primary_hit")
             return True
         if primary_hit is None:
+            self._bump("primary_inflight")
             return None
 
         any_none = False
         for tier in self.secondary_tiers:
+            self._bump("sec_lookup")
             result = tier.lookup(key, req_context)
             if result is True:
+                self._bump("sec_hit")
                 if not self._initiate_promotion(tier, key, req_context):
+                    self._bump("promo_fail")
                     return False  # primary full, block unavailable
+                self._bump("promo_ok")
                 return None  # promotion started, retry later
             if result is None:
                 any_none = True
 
         if any_none:
             return None
+        self._bump("miss")
         return False
 
     def _initiate_promotion(
