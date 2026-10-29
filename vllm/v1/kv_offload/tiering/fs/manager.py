@@ -41,7 +41,12 @@ from vllm.v1.kv_offload.tiering.base import (
     RequestOffloadingContext,
     SecondaryTierManager,
 )
-from vllm.v1.kv_offload.tiering.fs.capacity import GIB, DirCapacity, get_dir_capacity
+from vllm.v1.kv_offload.tiering.fs.capacity import (
+    DEFAULT_STATE_MAX_BYTES,
+    GIB,
+    DirCapacity,
+    get_dir_capacity,
+)
 from vllm.v1.kv_offload.tiering.fs.io import load_block, store_block
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 
@@ -72,6 +77,7 @@ class FileSystemTierManager(SecondaryTierManager):
         root_dir: str,
         max_bytes: int | None = None,
         max_overshoot_bytes: int = GIB,
+        state_max_bytes: int = DEFAULT_STATE_MAX_BYTES,
         n_read_threads: int = 16,
         n_write_threads: int = 16,
     ):
@@ -85,6 +91,10 @@ class FileSystemTierManager(SecondaryTierManager):
             max_bytes: Hard capacity of the whole cache directory (required).
             max_overshoot_bytes: How far one job may push the cache above
                 max_bytes before stores are rejected.
+            state_max_bytes: Hard cap on Mamba checkpoint (recurrent state)
+                bytes inside the same directory. Checkpoints beyond it are
+                dropped oldest-first, together with the attention of the same
+                block; 0 disables the cap.
             n_read_threads: Number of read-priority I/O threads.
             n_write_threads: Number of write-priority I/O threads.
         """
@@ -108,6 +118,11 @@ class FileSystemTierManager(SecondaryTierManager):
         if int(max_bytes) <= 0:
             raise ValueError(f"fs tier: max_bytes must be positive, got {max_bytes}")
         self.max_bytes = int(max_bytes)
+        if int(state_max_bytes) < 0:
+            raise ValueError(
+                f"fs tier: state_max_bytes must be >= 0, got {state_max_bytes}"
+            )
+        self.state_max_bytes = int(state_max_bytes)
 
         self.file_mapper = FileMapper.from_offloading_spec(
             root_dir=root_dir,
@@ -134,11 +149,18 @@ class FileSystemTierManager(SecondaryTierManager):
         group_indices = sorted(
             getattr(offloading_spec, "cpu_group_num_blocks", {}) or {}
         )
+        # Mamba groups hold recurrent state, not attention KV: they are
+        # accounted apart and capped by state_max_bytes.
+        mamba_groups: set[int] = set(
+            getattr(offloading_spec, "mamba_groups", ()) or ()
+        )
         self._cap = get_dir_capacity(
             root_dir,
             self.max_bytes,
             int(max_overshoot_bytes),
             group_indices=group_indices,
+            state_max_bytes=self.state_max_bytes,
+            mamba_groups=mamba_groups,
         )
         # Paths whose store job was queued but has not finished yet.
         self._pending_paths: set[str] = set()
