@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+import time
 from collections import OrderedDict
 from collections.abc import Collection, Iterable, Mapping
 from typing import Literal
@@ -20,6 +22,10 @@ from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 _CACHE_POLICIES: dict[str, type[CachePolicy]] = {
     "lru": LRUCachePolicy,
@@ -423,8 +429,35 @@ class GroupedCPUOffloadingManager(OffloadingManager):
     repeat across groups; the GPU transfer spec carries the original group ID.
     """
 
-    def __init__(self, managers: Mapping[int, OffloadingManager]):
+    def __init__(
+        self,
+        managers: Mapping[int, OffloadingManager],
+        mamba_groups: Collection[int] | None = None,
+    ):
         self.managers = managers
+        # Groups backed by Mamba state. A block is only restorable when its
+        # state half is present: the prefix-cache hit length is the minimum
+        # across groups, so attention KV past the last state checkpoint is
+        # never reused and only evicts restorable blocks.
+        self._mamba_groups = frozenset(mamba_groups or ())
+        self._dropped_stateless_keys = 0
+        self._gate_info: dict = {}
+        self._stats_enabled = os.environ.get("VLLM_TIER_STATS") == "1"
+        self._stats: dict[int, list[int]] = {}
+        self._stats_last = time.monotonic()
+
+    def _bump_group(self, group_idx: int, slot: int, value: int) -> None:
+        if not self._stats_enabled:
+            return
+        acc = self._stats.setdefault(group_idx, [0, 0, 0])
+        acc[slot] += value
+        now = time.monotonic()
+        if now - self._stats_last >= 10.0:
+            self._stats_last = now
+            logger.info(
+                "GROUPED-STORE group_in_out_ev=%s",
+                {g: tuple(v) for g, v in sorted(self._stats.items())},
+            )
 
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         contexts = [m.on_new_request(req_context) for m in self.managers.values()]
@@ -484,9 +517,13 @@ class GroupedCPUOffloadingManager(OffloadingManager):
     def prepare_store(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> PrepareStoreOutput | None:
+        # No store gate: attention of a block below its Mamba checkpoint
+        # boundary is still required to rebuild the prefix chain from block
+        # zero. Dropping it made every tier lookup miss.
         block_ids: dict[OffloadKey, int] = {}
         evicted_keys: list[OffloadKey] = []
         for group_idx, group_keys in self._partition(keys).items():
+            self._bump_group(group_idx, 0, len(group_keys))
             output = self.managers[group_idx].prepare_store(group_keys, req_context)
             if output is None:
                 # The scheduler advances every group's store cursor on success.
@@ -496,6 +533,8 @@ class GroupedCPUOffloadingManager(OffloadingManager):
                 self.complete_store(list(block_ids), req_context, success=False)
                 return None
             assert isinstance(output.store_spec, CPULoadStoreSpec)
+            self._bump_group(group_idx, 1, len(output.keys_to_store))
+            self._bump_group(group_idx, 2, len(output.evicted_keys))
             block_ids.update(
                 zip(output.keys_to_store, map(int, output.store_spec.block_ids))
             )
