@@ -17,6 +17,13 @@ Configuration via kv_connector_extra_config:
       - Additional tier-specific parameters are passed directly to the tier
         constructor. See each tier's documentation for supported parameters.
 
+    The "fs" tier accepts, besides root_dir:
+      - max_bytes: (required) hard capacity of the whole directory
+      - max_overshoot_bytes: how far one job may push usage above max_bytes
+      - state_max_bytes: hard cap on Mamba checkpoint (recurrent state) bytes,
+        default 4 GiB, 0 disables it. Checkpoints past the cap are dropped
+        oldest-first together with the attention of the same block.
+
 Example configuration:
 {
     "cpu_bytes_to_use": 10737418240,  # 10 GB
