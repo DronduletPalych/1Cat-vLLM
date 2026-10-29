@@ -4,6 +4,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import islice
 import os
+import time
 from typing import Any, NamedTuple
 
 from vllm.distributed.kv_events import BlockRemoved, BlockStored, KVCacheEvent
@@ -354,6 +355,15 @@ class OffloadingConnectorScheduler:
         }
         self.manager: OffloadingManager = spec.get_manager()
 
+        # Diagnostics for the "no deferred work" invariant (TZ §3.3). All
+        # counters live in the scheduler process, next to the tier managers.
+        self._defer_stats: dict[str, int] = {
+            "deferred_stores": 0,
+            "deferred_promotions": 0,
+            "store_cannot_proceed": 0,
+        }
+        self._defer_last_log = time.monotonic()
+
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
         for group_config in self.config.kv_group_configs:
@@ -416,6 +426,10 @@ class OffloadingConnectorScheduler:
         # protected by their ref_cnt) and for sliding window blocks (which can
         # be freed before a request finishes).
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
+        # (req_id, boundary_tokens) -> pairing attempts. A boundary state is
+        # held back until every attention group has its block for that
+        # boundary, so the pair is always stored together.
+        self._boundary_pair_retries: dict[tuple[str, int], int] = {}
 
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
@@ -631,6 +645,7 @@ class OffloadingConnectorScheduler:
                 num_hit_tokens = new_num_hit_tokens
 
         if defer_lookup:
+            self._defer_stats["deferred_promotions"] += 1
             logger.debug(
                 "Offloading manager delayed request %s as backend requested",
                 req_status.req.request_id,
@@ -900,6 +915,7 @@ class OffloadingConnectorScheduler:
             if req_status.transfer_jobs:
                 any_jid = next(iter(req_status.transfer_jobs))
                 if not self._jobs[any_jid].is_store:
+                    self._defer_stats["deferred_stores"] += 1
                     continue
 
             if preempted:
@@ -1030,6 +1046,7 @@ class OffloadingConnectorScheduler:
                 new_offload_keys, req_status.req_context
             )
             if store_output is None:
+                self._defer_stats["store_cannot_proceed"] += 1
                 logger.warning("Request %s: cannot store blocks", req_id)
                 continue
 
@@ -1194,6 +1211,90 @@ class OffloadingConnectorScheduler:
         )
         pending.clear()
 
+    def _add_boundary_attention_keys(
+        self,
+        keys: list[OffloadKey],
+        key_info: dict[OffloadKey, tuple[int, int, int]],
+        req_status: RequestOffloadState,
+        boundary_tokens: int,
+    ) -> list[int]:
+        """Attach the attention KV of the same block to a boundary-state store.
+
+        Returns the group indices whose block is simply not materialised yet;
+        the caller retries the boundary on a later step instead of storing a
+        block whose attention half is missing.
+
+        With ``retention_interval=0`` the core keeps Mamba checkpoints only on
+        replay boundaries while attention KV is cached for every block. A block
+        is reusable only when both halves exist (the prefix-cache hit length is
+        the minimum over groups), so the attention half must be stored together
+        with the state: same job, same block hash, same page group.
+        """
+        present = set(keys)
+        block_size_factor = self.config.block_size_factor
+        added = 0
+        skipped: dict[int, str] = {}
+        not_ready: list[int] = []
+        for group_config in self.config.kv_group_configs:
+            gidx = group_config.group_idx
+            if group_config.requires_exact_boundary_source:
+                continue
+            block_size = group_config.offloaded_block_size
+            if block_size <= 0 or boundary_tokens % block_size:
+                skipped[gidx] = f"misaligned:{boundary_tokens}%{block_size}"
+                continue
+            block_idx = boundary_tokens // block_size - 1
+            if block_idx < 0:
+                skipped[gidx] = "neg_idx"
+                continue
+            group_state = req_status.group_states[gidx]
+            if block_idx >= len(group_state.offload_keys):
+                skipped[gidx] = f"idx:{block_idx}>=keys:{len(group_state.offload_keys)}"
+                not_ready.append(gidx)
+                continue
+            alignment_block_count = group_config.alignment_block_count
+            if alignment_block_count is not None:
+                tail = group_config.sliding_window_size_in_blocks
+                assert tail is not None
+                if block_idx % alignment_block_count < alignment_block_count - tail:
+                    skipped[gidx] = (
+                        f"swa_align:{block_idx % alignment_block_count}"
+                        f"<{alignment_block_count - tail}"
+                    )
+                    continue
+            pos = block_idx * block_size_factor + block_size_factor - 1
+            if pos >= len(group_state.block_ids):
+                skipped[gidx] = f"pos:{pos}>=bids:{len(group_state.block_ids)}"
+                not_ready.append(gidx)
+                continue
+            gpu_block_id = group_state.block_ids[pos]
+            if gpu_block_id == 0:
+                skipped[gidx] = f"gpu_id0@pos{pos}"
+                continue
+            offload_key = group_state.offload_keys[block_idx]
+            if offload_key in present:
+                skipped[gidx] = "dup"
+                continue
+            present.add(offload_key)
+            keys.append(offload_key)
+            key_info[offload_key] = (
+                gidx,
+                gpu_block_id,
+                boundary_tokens // group_config.gpu_block_size - 1,
+            )
+            added += 1
+        logger.info(
+            "OFFLOAD-BOUNDARY-PAIR req=%s boundary=%d added=%d bsf=%d "
+            "not_ready=%s skip=%s",
+            req_status.req.request_id,
+            boundary_tokens,
+            added,
+            block_size_factor,
+            not_ready,
+            skipped,
+        )
+        return not_ready
+
     def _build_boundary_state_store_jobs(
         self,
         scheduler_output: SchedulerOutput,
@@ -1221,6 +1322,7 @@ class OffloadingConnectorScheduler:
             if req_status.transfer_jobs:
                 any_jid = next(iter(req_status.transfer_jobs))
                 if not self._jobs[any_jid].is_store:
+                    self._defer_stats["deferred_stores"] += 1
                     continue
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
             num_offloadable_tokens = min(
@@ -1287,6 +1389,29 @@ class OffloadingConnectorScheduler:
                         block_id,
                         boundary_tokens // group_config.gpu_block_size - 1,
                     )
+                # The block's attention half rides along with its state, so
+                # the two are written together and never split on eviction.
+                not_ready = self._add_boundary_attention_keys(
+                    keys, key_info, req_status, boundary_tokens
+                )
+                if not_ready:
+                    pair_key = (req_id, boundary_tokens)
+                    tries = self._boundary_pair_retries.get(pair_key, 0) + 1
+                    self._boundary_pair_retries[pair_key] = tries
+                    if tries <= 8:
+                        still_pending.extend(entries)
+                        continue
+                    logger.warning(
+                        "Request %s: storing boundary %d without attention "
+                        "groups %s after %d attempts",
+                        req_id,
+                        boundary_tokens,
+                        not_ready,
+                        tries,
+                    )
+                self._boundary_pair_retries.pop(
+                    (req_id, boundary_tokens), None
+                )
                 if not keys:
                     continue
                 store_output = self.manager.prepare_store(
@@ -1492,6 +1617,20 @@ class OffloadingConnectorScheduler:
         Returns:
             A list of KV cache events.
         """
+        now = time.monotonic()
+        if now - self._defer_last_log >= 10.0:
+            self._defer_last_log = now
+            pinned = sum(len(job.keys) for job in self._jobs.values())
+            st = self._defer_stats
+            logger.info(
+                "OFFLOAD-DEFER deferred_stores=%d deferred_promotions=%d "
+                "store_cannot_proceed=%d pinned_blocks=%d inflight_jobs=%d",
+                st["deferred_stores"],
+                st["deferred_promotions"],
+                st["store_cannot_proceed"],
+                pinned,
+                len(self._jobs),
+            )
         for event in self.manager.take_events():
             block_hashes = [get_offload_block_hash(key) for key in event.keys]
             if event.removed:
