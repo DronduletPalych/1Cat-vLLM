@@ -137,9 +137,13 @@ class CPUOffloadingSpec(OffloadingSpec):
 
         self.cpu_group_page_sizes: dict[int, int] = {}
         self.cpu_group_num_blocks: dict[int, int] = {}
+        # Group indices backed by a MambaSpec (state, not attention KV).
+        # Exposed so the grouped offload manager can tell a restorable block
+        # (attention + state) from a half-block that can never be a hit.
+        self.mamba_groups: set[int] = set()
         world_size = vllm_config.parallel_config.world_size
         if self.partition_by_group:
-            mamba_groups: set[int] = set()
+            mamba_groups: set[int] = self.mamba_groups
             mamba_spec: MambaSpec | None = None
             for i, group in cacheable_groups.items():
                 layer_names = set(group.layer_names)
