@@ -115,6 +115,19 @@ class DualQueueThreadPool:
                 self._store_q.append((fn, state))
             self._condition.notify(n_tasks)
 
+    def fail_job(self, job_id: JobId) -> None:
+        """Report a job as failed without running any task.
+
+        Used when the tier refuses a store before any I/O happens (capacity
+        hard cap): the framework still has to see the job finish, so the
+        pinned blocks are released and are never treated as stored.
+        """
+        self._finished_q.append((job_id, False))
+
+    def finish_empty_job(self, job_id: JobId) -> None:
+        """Report a job with no I/O tasks as completed successfully."""
+        self._finished_q.append((job_id, True))
+
     def get_finished(self) -> list[tuple[JobId, bool]]:
         jobs = []
         while self._finished_q:
