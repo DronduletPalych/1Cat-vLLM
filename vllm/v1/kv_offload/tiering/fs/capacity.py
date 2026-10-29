@@ -15,6 +15,12 @@ Design (TZ ред.5, variant A):
   * soft overshoot: a job may push ``used`` above ``max_bytes`` but never above
     ``max_bytes + max_overshoot_bytes``; beyond that the job is rejected;
   * after every finished job the cache is trimmed back to ``max_bytes``;
+  * Mamba state files (a file whose group directory is ``_g<k>`` with ``k`` in
+    ``mamba_groups``) are accounted apart from attention files and additionally
+    capped by ``state_max_bytes`` (default 4 GiB). When the state cap is
+    exceeded the *oldest* checkpoint is dropped first (FIFO by commit time, not
+    LRU by read), and the drop removes the whole block bundle: attention kept
+    without its checkpoint can never rebuild a prefix from block zero;
   * a background thread compares the on-disk sum with the committed counter and
     publishes ``fs_accounting_drift_bytes``.
 
@@ -41,11 +47,23 @@ LOCK_NAME = ".fs_tier.lock"
 _DRIFT_INTERVAL_S = 60.0
 _METRICS_INTERVAL_S = 10.0
 
+# Default cap for Mamba checkpoint (recurrent state) bytes inside one tier
+# directory. A checkpoint costs one file per Mamba group; without a cap each
+# turn of each session adds one and the checkpoints evict the attention blocks
+# they are supposed to make restorable.
+DEFAULT_STATE_MAX_BYTES = 4 * GIB
+
 
 @dataclass
 class _Entry:
     size: int
     reads: int = 0
+    # True for a Mamba state file: accounted in the state pool, not attention.
+    state: bool = False
+
+
+# (block directory, block hash) identifies one block across all KV groups.
+_BlockKey = tuple[str, str]
 
 
 class DirCapacity:
@@ -57,22 +75,32 @@ class DirCapacity:
         max_bytes: int,
         max_overshoot_bytes: int = GIB,
         group_indices: list[int] | None = None,
+        state_max_bytes: int = DEFAULT_STATE_MAX_BYTES,
+        mamba_groups: list[int] | set[int] | None = None,
     ) -> None:
         if max_bytes <= 0:
             raise ValueError("fs tier: max_bytes must be positive")
         if max_overshoot_bytes < 0:
             raise ValueError("fs tier: max_overshoot_bytes must be >= 0")
+        if state_max_bytes < 0:
+            raise ValueError("fs tier: state_max_bytes must be >= 0")
 
         self.root_dir = root_dir
         self.real_root = os.path.realpath(root_dir)
         self.max_bytes = int(max_bytes)
         self.max_overshoot_bytes = int(max_overshoot_bytes)
+        # 0 disables the state cap (attention-only tier, or a deliberately
+        # unbounded checkpoint pool); any positive value is a hard cap.
+        self.state_max_bytes = int(state_max_bytes)
         # KV group indices of the layout. A block is one file per group, so
         # eviction must remove every group file of a block: a half-block
         # (attention without state) is unreadable and only wastes capacity.
         self._group_indices: tuple[int, ...] = (
             tuple(sorted(group_indices)) if group_indices else ()
         )
+        # Groups whose files hold Mamba recurrent state rather than attention
+        # KV. Empty until a tier manager knows the layout.
+        self._mamba_groups: frozenset[int] = frozenset(mamba_groups or ())
 
         self._lock = threading.RLock()
         # Sizes plus two eviction classes (TZ §3.1): blocks written and never
@@ -85,9 +113,19 @@ class DirCapacity:
         self._used = 0  # committed + reserved
         self._committed = 0  # committed only (matches on-disk sum)
         self._reserved_sizes: dict[str, int] = {}
+        # Split accounting: Mamba state files vs attention files. Both are
+        # subsets of ``_committed``, so the drift check stays defined against
+        # the whole sum and must remain 0.
+        self._state_bytes = 0
+        self._attn_bytes = 0
+        # Mamba checkpoints in write order, oldest first. One entry per block
+        # bundle (all groups of that block), so dropping a checkpoint drops the
+        # attention of the same block with it.
+        self._checkpoints: OrderedDict[_BlockKey, str] = OrderedDict()
 
         self.instances = 0
         self.evictions = 0
+        self.state_evictions = 0
         self.rejected = 0
         self.store_failed = 0
         self.load_errors = 0
@@ -108,13 +146,18 @@ class DirCapacity:
 
         logger.info(
             "FS-CAP pid=%d root_dir=%s used=%d limit=%d overshoot_limit=%d "
-            "files=%d lock=acquired",
+            "files=%d state_max=%d state_bytes=%d attn_bytes=%d checkpoints=%d "
+            "lock=acquired",
             os.getpid(),
             self.real_root,
             self._used,
             self.max_bytes,
             self.max_overshoot_bytes,
             self.files,
+            self.state_max_bytes,
+            self._state_bytes,
+            self._attn_bytes,
+            len(self._checkpoints),
         )
         self._stop = threading.Event()
         self._thread = threading.Thread(
@@ -161,6 +204,8 @@ class DirCapacity:
         """Rebuild ``used`` from the real directory contents."""
         total = 0
         files = 0
+        state_bytes = 0
+        attn_bytes = 0
         found: list[tuple[float, str, int]] = []
         for dirpath, _dirnames, filenames in os.walk(self.real_root):
             for name in filenames:
@@ -174,24 +219,40 @@ class DirCapacity:
                 size = self._entry_size(st.st_size)
                 total += size
                 files += 1
+                if self._is_state_path(path):
+                    state_bytes += size
+                else:
+                    attn_bytes += size
                 found.append((st.st_mtime, path, size))
         self._entries.clear()
         self._unread.clear()
         self._read.clear()
+        self._checkpoints.clear()
         # atime is useless under noatime; restore the order from mtime.
         found.sort()
         for _mtime, path, size in found:
-            self._entries[path] = _Entry(size=size, reads=0)
+            self._entries[path] = _Entry(size=size, state=self._is_state_path(path))
             self._unread[path] = None
+            if self._entries[path].state:
+                # mtime order is write order: the oldest checkpoint is the
+                # first candidate once the state cap is exceeded.
+                self._checkpoints.setdefault(self._block_key(path), path)
         self._used = total
         self._committed = total
+        self._state_bytes = state_bytes
+        self._attn_bytes = attn_bytes
         self.files = files
         self._last_drift_scan = time.monotonic()
         logger.info(
-            "FS-CAP-SCAN root_dir=%s used=%d files=%d",
+            "FS-CAP-SCAN root_dir=%s used=%d files=%d state_bytes=%d "
+            "attn_bytes=%d checkpoints=%d state_max=%d",
             self.real_root,
             total,
             files,
+            state_bytes,
+            attn_bytes,
+            len(self._checkpoints),
+            self.state_max_bytes,
         )
 
     def register_instance(self) -> int:
@@ -214,6 +275,66 @@ class DirCapacity:
         with self._lock:
             if not self._group_indices and group_indices:
                 self._group_indices = tuple(sorted(group_indices))
+
+    def set_mamba_groups(self, mamba_groups: list[int] | set[int] | None) -> None:
+        """Adopt the layout's Mamba groups once a tier manager knows them."""
+        with self._lock:
+            groups = frozenset(mamba_groups or ())
+            if groups == self._mamba_groups:
+                return
+            known_before = bool(self._mamba_groups)
+            self._mamba_groups = groups
+            if not known_before and groups:
+                # The startup scan classified every file as attention because
+                # the layout was not known yet: redo the split and the
+                # checkpoint queue so the cap applies to what is already there.
+                self._reclassify_locked()
+
+    def _reclassify_locked(self) -> None:
+        """Recompute the state/attention split after the layout became known."""
+        state_bytes = 0
+        attn_bytes = 0
+        for path, entry in self._entries.items():
+            entry.state = self._is_state_path(path)
+            if entry.state:
+                state_bytes += entry.size
+            else:
+                attn_bytes += entry.size
+        self._state_bytes = state_bytes
+        self._attn_bytes = attn_bytes
+        self._checkpoints.clear()
+        ordered: list[tuple[float, str]] = []
+        for path, entry in self._entries.items():
+            if not entry.state:
+                continue
+            try:
+                mtime = os.stat(path).st_mtime
+            except OSError:
+                mtime = 0.0
+            ordered.append((mtime, path))
+        ordered.sort()
+        for _mtime, path in ordered:
+            self._checkpoints.setdefault(self._block_key(path), path)
+
+    @staticmethod
+    def _group_of(path: str) -> int | None:
+        """KV group index encoded in the group directory name (``_g<k>``)."""
+        group_dir = os.path.basename(os.path.dirname(path))
+        _head, sep, tail = group_dir.rpartition("_g")
+        if not sep or not tail.isdigit():
+            return None
+        return int(tail)
+
+    def _is_state_path(self, path: str) -> bool:
+        """True when the file holds Mamba recurrent state, not attention KV."""
+        if not self._mamba_groups:
+            return False
+        return self._group_of(path) in self._mamba_groups
+
+    @staticmethod
+    def _block_key(path: str) -> _BlockKey:
+        """Identity of a block across every group directory."""
+        return (os.path.dirname(os.path.dirname(path)), os.path.basename(path))
 
     def _bundle_paths_locked(self, path: str) -> list[str]:
         """Every group file of the same block, derived from the naming.
@@ -247,10 +368,12 @@ class DirCapacity:
                 return path
         return None
 
-    def _evict_one_locked(self) -> bool:
-        path = self._pick_victim_locked()
-        if path is None:
-            return False
+    def _evict_bundle_locked(self, path: str) -> int:
+        """Remove every group file of the block that owns *path*.
+
+        Returns the number of files removed. Files that are reserved or being
+        read are skipped: a block is never split while it is in flight.
+        """
         removed = 0
         for victim in self._bundle_paths_locked(path):
             entry = self._entries.get(victim)
@@ -263,6 +386,10 @@ class DirCapacity:
             except OSError as exc:
                 logger.warning("FS-EVICT-FAIL path=%s err=%s", victim, exc)
                 continue
+            if entry.state:
+                self._state_bytes -= entry.size
+            else:
+                self._attn_bytes -= entry.size
             self._entries.pop(victim, None)
             self._unread.pop(victim, None)
             self._read.pop(victim, None)
@@ -271,16 +398,83 @@ class DirCapacity:
             self.files -= 1
             self.evictions += 1
             removed += 1
-        return removed > 0
+        # The block is gone (fully, or partially if a file was busy): never
+        # keep it as a checkpoint candidate. A stale candidate would make the
+        # state cap spin on the same block forever.
+        self._checkpoints.pop(self._block_key(path), None)
+        return removed
+
+    def _evict_one_locked(self) -> bool:
+        path = self._pick_victim_locked()
+        if path is None:
+            return False
+        return self._evict_bundle_locked(path) > 0
+
+    def _pick_state_victim_locked(self) -> tuple[_BlockKey, str] | None:
+        """The oldest checkpoint, if its whole bundle is idle."""
+        stale: list[_BlockKey] = []
+        victim: tuple[_BlockKey, str] | None = None
+        for key, path in self._checkpoints.items():
+            if path not in self._entries:
+                stale.append(key)
+                continue
+            if any(self._inflight.get(p) for p in self._bundle_paths_locked(path)):
+                # The oldest checkpoint is being read right now. Do not fall
+                # through to a newer one: evicting the checkpoint a session
+                # just wrote is exactly what the cap exists to prevent, so
+                # wait for the reader instead.
+                break
+            victim = (key, path)
+            break
+        for key in stale:
+            self._checkpoints.pop(key, None)
+        return victim
+
+    def _enforce_state_cap_locked(self) -> None:
+        """Drop the oldest Mamba checkpoints until state bytes fit the cap.
+
+        FIFO by commit order, deliberately not LRU: the checkpoint just written
+        by the current turn is the one the next turn of that session needs, and
+        reading it must not make a stale checkpoint look younger.
+        """
+        if not self.state_max_bytes or not self._state_bytes:
+            return
+        while self._state_bytes > self.state_max_bytes:
+            victim = self._pick_state_victim_locked()
+            if victim is None:
+                # Nothing idle to drop right now; the next commit or trim
+                # retries once the in-flight reader finishes.
+                return
+            key, path = victim
+            removed = self._evict_bundle_locked(path)
+            if removed == 0:
+                self._checkpoints.pop(key, None)
+                continue
+            self.state_evictions += 1
+            logger.info(
+                "FS-STATE-EVICT path=%s removed=%d state_bytes=%d state_max=%d "
+                "used=%d limit=%d checkpoints=%d",
+                path,
+                removed,
+                self._state_bytes,
+                self.state_max_bytes,
+                self._used,
+                self.max_bytes,
+                len(self._checkpoints),
+            )
 
     def _make_room_locked(self, need: int) -> None:  # noqa: D401
         """Evict LRU blocks until ``need`` more bytes fit under the limit."""
+        # State first: attention below an over-cap checkpoint is the cheaper
+        # thing to keep, and dropping a checkpoint frees attention with it.
+        self._enforce_state_cap_locked()
         while self._used + need > self.max_bytes:
             if not self._evict_one_locked():
                 return
 
     def _trim_locked(self) -> None:
         """Enforce ``used <= max_bytes`` once no job is waiting on space."""
+        self._enforce_state_cap_locked()
         while self._used > self.max_bytes:
             if not self._evict_one_locked():
                 return
@@ -345,11 +539,21 @@ class DirCapacity:
             self._reserved_sizes.pop(path, None)
             entry = self._entries.get(path)
             if entry is None:
-                self._entries[path] = _Entry(size=size, reads=0)
+                entry = _Entry(size=size, reads=0, state=self._is_state_path(path))
+                self._entries[path] = entry
                 # Newly written, never read: oldest-unread goes first.
                 self._unread[path] = None
                 self._committed += size
                 self.files += 1
+                if entry.state:
+                    self._state_bytes += size
+                    # Commit order is checkpoint age: a bundle keeps the slot
+                    # of its first state file, so re-storing one group of an
+                    # existing checkpoint does not make it look young.
+                    self._checkpoints.setdefault(self._block_key(path), path)
+                else:
+                    self._attn_bytes += size
+            self._enforce_state_cap_locked()
 
     def fail_store(self, path: str) -> None:
         """A store failed: give the reserved bytes back."""
@@ -411,6 +615,11 @@ class DirCapacity:
             self._read.pop(path, None)
             if entry is None:
                 return
+            if entry.state:
+                self._state_bytes -= entry.size
+                self._checkpoints.pop(self._block_key(path), None)
+            else:
+                self._attn_bytes -= entry.size
             self._used -= entry.size
             self._committed -= entry.size
             self.files -= 1
@@ -422,6 +631,11 @@ class DirCapacity:
             return {
                 "fs_bytes_used": self._used,
                 "fs_bytes_limit": self.max_bytes,
+                "fs_state_bytes": self._state_bytes,
+                "fs_attn_bytes": self._attn_bytes,
+                "fs_state_bytes_limit": self.state_max_bytes,
+                "fs_state_evictions_total": self.state_evictions,
+                "fs_checkpoints": len(self._checkpoints),
                 "fs_overshoot_bytes": max(0, self._used - self.max_bytes),
                 "fs_evictions_total": self.evictions,
                 "fs_store_rejected_total": self.rejected,
@@ -443,8 +657,9 @@ class DirCapacity:
         logger.info(
             "FS-METRICS used=%d limit=%d overshoot=%d peak_overshoot=%d "
             "evictions=%d rejected=%d store_failed=%d load_errors=%d "
-            "drift=%d files=%d stored_blocks=%d loaded_blocks=%d "
-            "lookups=%d lookup_hits=%d inflight=%d instances=%d",
+            "drift=%d state_bytes=%d attn_bytes=%d state_limit=%d "
+            "state_evict=%d checkpoints=%d files=%d stored_blocks=%d "
+            "loaded_blocks=%d lookups=%d lookup_hits=%d inflight=%d instances=%d",
             snap["fs_bytes_used"],
             snap["fs_bytes_limit"],
             snap["fs_overshoot_bytes"],
@@ -454,6 +669,11 @@ class DirCapacity:
             snap["fs_store_failed_total"],
             snap["fs_load_errors_total"],
             snap["fs_accounting_drift_bytes"],
+            snap["fs_state_bytes"],
+            snap["fs_attn_bytes"],
+            snap["fs_state_bytes_limit"],
+            snap["fs_state_evictions_total"],
+            snap["fs_checkpoints"],
             snap["fs_files"],
             snap["fs_stored_blocks"],
             snap["fs_loaded_blocks"],
@@ -538,6 +758,8 @@ def get_dir_capacity(
     max_bytes: int | None,
     max_overshoot_bytes: int = GIB,
     group_indices: list[int] | None = None,
+    state_max_bytes: int = DEFAULT_STATE_MAX_BYTES,
+    mamba_groups: list[int] | set[int] | None = None,
 ) -> DirCapacity:
     """Return the process-wide capacity object for *root_dir*."""
     real = os.path.realpath(root_dir)
@@ -554,6 +776,8 @@ def get_dir_capacity(
                 int(max_bytes),
                 int(max_overshoot_bytes),
                 group_indices=group_indices,
+                state_max_bytes=state_max_bytes,
+                mamba_groups=mamba_groups,
             )
             _DIR_STATE[real] = state
         elif max_bytes is not None and int(max_bytes) != state.max_bytes:
@@ -561,6 +785,12 @@ def get_dir_capacity(
                 f"fs tier: conflicting max_bytes for {real}: "
                 f"{int(max_bytes)} != {state.max_bytes}"
             )
+        elif int(state_max_bytes) != state.state_max_bytes:
+            raise ValueError(
+                f"fs tier: conflicting state_max_bytes for {real}: "
+                f"{int(state_max_bytes)} != {state.state_max_bytes}"
+            )
         state.set_group_indices(group_indices)
+        state.set_mamba_groups(mamba_groups)
         state.register_instance()
         return state

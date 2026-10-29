@@ -266,3 +266,251 @@ def test_default_overshoot_is_one_gib(tmp_path):
         assert cap.max_overshoot_bytes == GIB
     finally:
         cap.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Mamba state cap
+# ---------------------------------------------------------------------------
+
+# The real layout has nine groups: six Mamba (recurrent state) and three
+# attention. A restorable block needs all nine, so a checkpoint eviction must
+# remove the attention of the same block too.
+_STATE_GROUPS = (0, 1, 2, 3, 4, 5)
+_ATTN_GROUPS = (6, 7, 8)
+_GROUPS = _STATE_GROUPS + _ATTN_GROUPS
+_CP_STATE_BYTES = len(_STATE_GROUPS) * _ENTRY  # on-disk cost of one checkpoint
+_BUNDLE_BYTES = len(_GROUPS) * _ENTRY  # one block, every group
+
+
+def _group_path(root, n, group):
+    """Path of one group file of block *n*, in the real tier layout."""
+    block_hash = f"{n:032x}"
+    return os.path.join(
+        str(root),
+        "cache_r0",
+        block_hash[:3],
+        f"{block_hash[:2]}_g{group}",
+        block_hash + ".bin",
+    )
+
+
+def _materialise(root, n, groups, mtime=None):
+    """Write the group files of block *n* without any capacity accounting."""
+    paths = {}
+    for group in groups:
+        path = _group_path(root, n, group)
+        _write(path, mtime=mtime)
+        paths[group] = path
+    return paths
+
+
+def _store_file(cap, root, n, group, mtime=None):
+    """Reserve, write and commit one group file, as the tier does."""
+    path = _group_path(root, n, group)
+    assert cap.try_reserve(path, _ENTRY)
+    _write(path, mtime=mtime)
+    cap.commit_store(path, _ENTRY)
+    return path
+
+
+def _commit_checkpoint(cap, root, n, mtime=None):
+    """Store one Mamba checkpoint: state groups first, then attention."""
+    paths = {
+        group: _store_file(cap, root, n, group, mtime=mtime)
+        for group in _STATE_GROUPS
+    }
+    paths.update(
+        {
+            group: _store_file(cap, root, n, group, mtime=mtime)
+            for group in _ATTN_GROUPS
+        }
+    )
+    return paths
+
+
+@pytest.fixture
+def state_cap(tmp_path):
+    # Room for two checkpoints; the directory itself is far from full, so any
+    # eviction observed here is the state cap and nothing else.
+    cap = DirCapacity(
+        str(tmp_path),
+        max_bytes=64 * _BUNDLE_BYTES,
+        max_overshoot_bytes=_ENTRY,
+        group_indices=list(_GROUPS),
+        state_max_bytes=2 * _CP_STATE_BYTES,
+        mamba_groups=list(_STATE_GROUPS),
+    )
+    yield cap
+    cap.shutdown()
+
+
+def test_default_state_cap_is_four_gib(tmp_path):
+    cap = DirCapacity(
+        str(tmp_path),
+        max_bytes=64 * GIB,
+        group_indices=list(_GROUPS),
+        mamba_groups=list(_STATE_GROUPS),
+    )
+    try:
+        assert cap.state_max_bytes == 4 * GIB
+        assert cap.snapshot()["fs_state_bytes_limit"] == 4 * GIB
+    finally:
+        cap.shutdown()
+
+
+def test_state_cap_evicts_the_oldest_checkpoint_as_a_whole_bundle(
+    state_cap, tmp_path
+):
+    first = _commit_checkpoint(state_cap, tmp_path, 0)
+    second = _commit_checkpoint(state_cap, tmp_path, 1)
+    snap = state_cap.snapshot()
+    assert snap["fs_state_bytes"] == 2 * _CP_STATE_BYTES
+    assert snap["fs_state_evictions_total"] == 0
+
+    third = _commit_checkpoint(state_cap, tmp_path, 2)
+
+    # The oldest checkpoint went away together with its attention: attention
+    # without its state can never rebuild a prefix, so it is not kept.
+    for group in _GROUPS:
+        assert not os.path.exists(first[group]), group
+    for group in _GROUPS:
+        assert os.path.exists(second[group]), group
+        assert os.path.exists(third[group]), group
+
+    snap = state_cap.snapshot()
+    assert snap["fs_state_bytes"] == 2 * _CP_STATE_BYTES
+    assert snap["fs_attn_bytes"] == 2 * len(_ATTN_GROUPS) * _ENTRY
+    assert snap["fs_state_evictions_total"] == 1
+    assert snap["fs_checkpoints"] == 2
+
+
+def test_state_cap_ignores_read_recency(state_cap, tmp_path):
+    first = _commit_checkpoint(state_cap, tmp_path, 0)
+    _commit_checkpoint(state_cap, tmp_path, 1)
+    # Reading the oldest checkpoint must not protect it: the cap is FIFO by
+    # commit time, and a stale checkpoint that happens to be read is still the
+    # one to drop.
+    for group in _GROUPS:
+        state_cap.touch(first[group])
+
+    _commit_checkpoint(state_cap, tmp_path, 2)
+
+    assert not os.path.exists(first[0])
+
+
+def test_attention_bytes_are_not_counted_as_state(tmp_path):
+    # Budget for exactly one checkpoint.
+    cap = DirCapacity(
+        str(tmp_path),
+        max_bytes=64 * _BUNDLE_BYTES,
+        group_indices=list(_GROUPS),
+        state_max_bytes=_CP_STATE_BYTES,
+        mamba_groups=list(_STATE_GROUPS),
+    )
+    try:
+        # Attention of blocks below the first checkpoint boundary has no state
+        # half at all; it must not consume the state budget.
+        for group in _ATTN_GROUPS:
+            _store_file(cap, tmp_path, 0, group)
+        snap = cap.snapshot()
+        assert snap["fs_state_bytes"] == 0
+        assert snap["fs_attn_bytes"] == len(_ATTN_GROUPS) * _ENTRY
+        assert snap["fs_checkpoints"] == 0
+        assert snap["fs_state_evictions_total"] == 0
+
+        # One checkpoint still fits: the attention above did not eat its room.
+        _commit_checkpoint(cap, tmp_path, 1)
+        snap = cap.snapshot()
+        assert snap["fs_state_bytes"] == _CP_STATE_BYTES
+        assert snap["fs_state_evictions_total"] == 0
+        assert snap["fs_checkpoints"] == 1
+    finally:
+        cap.shutdown()
+
+
+def test_state_eviction_keeps_accounting_exact(state_cap, tmp_path):
+    for n in range(5):
+        _commit_checkpoint(state_cap, tmp_path, n)
+
+    snap = state_cap.snapshot()
+    assert snap["fs_state_evictions_total"] == 3
+    assert snap["fs_state_bytes"] == 2 * _CP_STATE_BYTES
+    # The split must add up to the committed sum, and the committed sum must
+    # match what is really on disk (drift 0).
+    assert snap["fs_state_bytes"] + snap["fs_attn_bytes"] == snap["fs_bytes_used"]
+    assert snap["fs_bytes_used"] == 2 * _BUNDLE_BYTES
+    assert snap["fs_files"] == 2 * len(_GROUPS)
+    assert state_cap.drift_check() == 0
+
+
+def test_state_cap_waits_instead_of_dropping_a_fresh_checkpoint(
+    state_cap, tmp_path
+):
+    first = _commit_checkpoint(state_cap, tmp_path, 0)
+    _commit_checkpoint(state_cap, tmp_path, 1)
+    # A load of the oldest checkpoint is running. The cap must not jump ahead
+    # to the checkpoint that was just written; it waits for the reader.
+    state_cap.acquire_read(first[0])
+
+    third = _commit_checkpoint(state_cap, tmp_path, 2)
+    snap = state_cap.snapshot()
+    assert snap["fs_state_evictions_total"] == 0
+    assert all(os.path.exists(path) for path in third.values())
+    assert snap["fs_state_bytes"] == 3 * _CP_STATE_BYTES
+
+    state_cap.release_read(first[0])
+    state_cap.trim()
+
+    assert not os.path.exists(first[0])
+    assert state_cap.snapshot()["fs_state_bytes"] == 2 * _CP_STATE_BYTES
+
+
+def test_scan_classifies_existing_files_and_orders_checkpoints_by_mtime(tmp_path):
+    oldest = _materialise(tmp_path, 0, _GROUPS, mtime=1000)
+    _materialise(tmp_path, 1, _GROUPS, mtime=2000)
+    _materialise(tmp_path, 2, _GROUPS, mtime=3000)
+
+    # The cap must bite on the contents left by a previous run, not only on
+    # files this process writes.
+    cap = DirCapacity(
+        str(tmp_path),
+        max_bytes=64 * _BUNDLE_BYTES,
+        group_indices=list(_GROUPS),
+        state_max_bytes=2 * _CP_STATE_BYTES,
+        mamba_groups=list(_STATE_GROUPS),
+    )
+    try:
+        for group in _GROUPS:
+            assert not os.path.exists(oldest[group]), group
+        snap = cap.snapshot()
+        assert snap["fs_state_bytes"] == 2 * _CP_STATE_BYTES
+        assert snap["fs_attn_bytes"] == 2 * len(_ATTN_GROUPS) * _ENTRY
+        assert snap["fs_state_evictions_total"] == 1
+        assert snap["fs_checkpoints"] == 2
+        assert cap.drift_check() == 0
+    finally:
+        cap.shutdown()
+
+
+def test_mamba_groups_learned_after_scan_reclassify(tmp_path):
+    _materialise(tmp_path, 0, _GROUPS, mtime=1000)
+
+    cap = DirCapacity(
+        str(tmp_path),
+        max_bytes=64 * _BUNDLE_BYTES,
+        group_indices=list(_GROUPS),
+        state_max_bytes=_CP_STATE_BYTES,
+    )
+    try:
+        # Without the layout every file looks like attention.
+        assert cap.snapshot()["fs_state_bytes"] == 0
+
+        cap.set_mamba_groups(list(_STATE_GROUPS))
+
+        snap = cap.snapshot()
+        assert snap["fs_state_bytes"] == _CP_STATE_BYTES
+        assert snap["fs_attn_bytes"] == len(_ATTN_GROUPS) * _ENTRY
+        assert snap["fs_checkpoints"] == 1
+    finally:
+        cap.shutdown()
+
