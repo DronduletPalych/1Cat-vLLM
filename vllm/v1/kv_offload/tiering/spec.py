@@ -166,7 +166,9 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     secondary_tiers=tiers,
                     enable_events=enable_events,
                 )
-            manager = GroupedCPUOffloadingManager(managers)
+            manager = GroupedCPUOffloadingManager(
+                managers, mamba_groups=getattr(self, "mamba_groups", None)
+            )
             cleanup.pop_all()
             return manager
 
