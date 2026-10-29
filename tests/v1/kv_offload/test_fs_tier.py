@@ -29,6 +29,8 @@ from vllm.v1.kv_offload.tiering.fs.manager import (
 _BLOCK_ELEMENTS = 512 * 1024  # 2 MB per block (float32 × 512K = 2MB)
 _DTYPE = torch.float32
 _CTX = ReqContext(req_id="test")
+# Room for every block these tests write, with eviction out of the way.
+_MAX_BYTES = 1 << 30
 
 _MOCK_VLLM_CONFIG = MagicMock()
 _MOCK_VLLM_CONFIG.model_config.model = "test-model"
@@ -105,6 +107,8 @@ def fs_tier(tmp_path):
         primary_kv_view=mock_view,
         tier_type="fs",
         root_dir=str(tmp_path),
+        # The tier always runs under a hard capacity limit.
+        max_bytes=_MAX_BYTES,
         n_read_threads=4,
         n_write_threads=4,
     )
@@ -165,6 +169,7 @@ def test_invalid_path_raises_at_construction():
             primary_kv_view=mock_view,
             tier_type="fs",
             root_dir="/dev/null/invalid_path",
+            max_bytes=_MAX_BYTES,
         )
 
 
