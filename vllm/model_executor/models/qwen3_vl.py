@@ -867,16 +867,76 @@ class Qwen3_VisionTransformer(nn.Module):
         return loaded_params
 
 
+# Worst-case prefill for one image is bounded by this cap: a 768x768 image is
+# 2304 patches, i.e. 576 tokens after the 2x2 merge, which the CPU-offloaded
+# vision tower encodes inside the GPU headroom left by the KV cache reservation.
+_GGUF_MM_DEFAULT_SIZE = {"shortest_edge": 4096, "longest_edge": 589824}
+
+
+def _gguf_native_qwen3vl_processor(
+    info: "Qwen3VLProcessingInfo", **kwargs: object
+) -> Qwen3VLProcessor:
+    """Build the Qwen3-VL processor from GGUF metadata instead of an HF repo.
+
+    A native mmproj checkpoint ships no ``preprocessor_config.json`` and has no
+    HF repository behind it, so the image/video processors are constructed
+    directly: patch geometry and CLIP normalization come from the mmproj-derived
+    vision config, and the tokenizer is the checkpoint's own GGUF tokenizer.
+    """
+    tokenizer = info.get_tokenizer()
+    vision_config = info.get_hf_config().vision_config
+
+    size = dict(_GGUF_MM_DEFAULT_SIZE)
+    if (requested_size := kwargs.get("size")) is not None:
+        size.update(dict(requested_size))  # type: ignore[arg-type]
+    if (min_pixels := kwargs.get("min_pixels")) is not None:
+        size["shortest_edge"] = int(min_pixels)  # type: ignore[arg-type]
+    if (max_pixels := kwargs.get("max_pixels")) is not None:
+        size["longest_edge"] = int(max_pixels)  # type: ignore[arg-type]
+
+    common_kwargs: dict[str, object] = {
+        "patch_size": vision_config.patch_size,
+        "temporal_patch_size": vision_config.temporal_patch_size,
+        "merge_size": vision_config.spatial_merge_size,
+        "size": size,
+    }
+    # The mmproj stores the CLIP constants; fall back to the Qwen3-VL defaults
+    # only for checkpoints that omit them.
+    for key in ("image_mean", "image_std"):
+        common_kwargs[key] = list(getattr(vision_config, key, None) or [0.5, 0.5, 0.5])
+
+    return Qwen3VLProcessor(
+        image_processor=Qwen2VLImageProcessorFast(**common_kwargs),  # type: ignore[arg-type]
+        tokenizer=tokenizer,
+        video_processor=Qwen3VLVideoProcessor(**common_kwargs),  # type: ignore[arg-type]
+        chat_template=getattr(tokenizer, "chat_template", None),
+    )
+
+
 class Qwen3VLProcessingInfo(Qwen2VLProcessingInfo):
     def get_hf_config(self):
         return self.ctx.get_hf_config(Qwen3VLConfig)
 
     def get_hf_processor(self, **kwargs: object) -> Qwen3VLProcessor:
+        if getattr(self.ctx.model_config.hf_config, "gguf_native_mmproj", None):
+            return self._get_gguf_native_processor(**kwargs)
         return self.ctx.get_hf_processor(
             Qwen3VLProcessor,
             use_fast=kwargs.pop("use_fast", True),
             **kwargs,
         )
+
+    def _get_gguf_native_processor(self, **kwargs: object) -> Qwen3VLProcessor:
+        # The processor is stateless but rebuilt on every call otherwise
+        # (get_image_processor/get_video_processor route through here).
+        key = tuple(sorted((name, repr(value)) for name, value in kwargs.items()))
+        cache: dict[tuple, Qwen3VLProcessor] = (
+            getattr(self, "_gguf_processor_cache", None) or {}
+        )
+        if key not in cache:
+            cache[key] = _gguf_native_qwen3vl_processor(self, **kwargs)
+            self._gguf_processor_cache = cache
+        return cache[key]
 
     def get_image_processor(self, **kwargs: object) -> Qwen2VLImageProcessorFast:
         return self.get_hf_processor(**kwargs).image_processor

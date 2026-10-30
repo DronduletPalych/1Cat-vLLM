@@ -19,12 +19,19 @@ def get_gguf_adapter(config, tp_size=1):
             "language_model" if config.model_type == "qwen4_exp" else ""
         )
         return adapter
+    # A vision config means the checkpoint is multimodal: its mmproj tensors are
+    # indexed next to the backbone and must be mapped onto the vision module.
+    multimodal = getattr(config, "vision_config", None) is not None
     if config.get_text_config().model_type == "qwen3_5_moe_text":
         from .qwen35_moe import Qwen35MoeAdapter
 
-        return Qwen35MoeAdapter(config.get_text_config(), tp_size=tp_size)
+        return Qwen35MoeAdapter(
+            config.get_text_config(), tp_size=tp_size, multimodal=multimodal
+        )
     if config.get_text_config().model_type == "qwen3_5_text":
         from .qwen35 import Qwen35Adapter
 
-        return Qwen35Adapter(config.get_text_config(), tp_size=tp_size)
+        return Qwen35Adapter(
+            config.get_text_config(), tp_size=tp_size, multimodal=multimodal
+        )
     return None

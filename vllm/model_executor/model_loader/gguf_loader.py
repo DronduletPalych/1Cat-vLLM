@@ -149,6 +149,18 @@ class GGUFModelLoader(BaseModelLoader):
             local = self._prepare_weights(model_config)
             self._native_adapter = adapter
             self._native_tensors = gguf_tensor_index(gguf_shard_paths(local))
+            # A multimodal GGUF ships the vision tower + projector as a separate
+            # ``clip``-architecture mmproj next to the backbone. Index it on its
+            # own (the architectures differ, so the two files cannot share one
+            # gguf_tensor_index call) and merge it into the adapter's index.
+            mmproj_path = detect_gguf_multimodal(local)
+            if mmproj_path is not None and getattr(adapter, "multimodal", False):
+                logger.info(
+                    "Loading extra mm_proj weights from %s (native adapter route)",
+                    mmproj_path,
+                )
+                self._mmproj_path = mmproj_path
+                self._native_tensors.update(gguf_tensor_index([mmproj_path]))
             return adapter.build_name_map(self._native_tensors)
         # Get text config to handle both nested (multimodal) and flat
         # (text-only) config structures. For multimodal models like
@@ -392,20 +404,25 @@ class GGUFModelLoader(BaseModelLoader):
         for f in gguf_files:
             weight_type_map.update(get_gguf_weight_type_map(f, gguf_to_hf_name_map))
         is_multimodal = hasattr(model_config.hf_config, "vision_config")
-        if (
-            is_multimodal
-            and getattr(self, "_native_adapter", None) is None
-            and getattr(self, "multimodal_weights", None) is None
-        ):
-            mmproj_file = detect_gguf_multimodal(model_name_or_path)
-            assert mmproj_file is not None, (
-                "Could not find mm_proj file for multimodal GGUF model"
-            )
-            logger.info("Loading extra mm_proj weights from %s...", mmproj_file)
-            mm_proj_weight_type_map = get_gguf_weight_type_map(
-                mmproj_file, gguf_to_hf_name_map
-            )
-            weight_type_map.update(mm_proj_weight_type_map)
+        if is_multimodal and getattr(self, "multimodal_weights", None) is None:
+            # The vision tower and projector are F16/F32 tensors of the mmproj
+            # file. Their types must reach unquantized_modules so the GGUF
+            # quantizer leaves them as dense parameters.
+            mmproj_file = getattr(self, "_mmproj_path", None)
+            if mmproj_file is None and getattr(self, "_native_adapter", None) is None:
+                # Legacy Gemma3-style route: the tower file is discovered next
+                # to the backbone. A native adapter indexes its own mmproj and
+                # never searches for that legacy file name.
+                mmproj_file = detect_gguf_multimodal(model_name_or_path)
+                assert mmproj_file is not None, (
+                    "Could not find mm_proj file for multimodal GGUF model"
+                )
+            if mmproj_file is not None:
+                logger.info("Loading extra mm_proj weights from %s...", mmproj_file)
+                mm_proj_weight_type_map = get_gguf_weight_type_map(
+                    mmproj_file, gguf_to_hf_name_map
+                )
+                weight_type_map.update(mm_proj_weight_type_map)
         return weight_type_map
 
     def _get_weights_iterator(
@@ -487,10 +504,52 @@ class GGUFModelLoader(BaseModelLoader):
         for name, tensor in self._get_weights_iterator(
             model_config, local_model_path, gguf_weights_map
         ):
-            yield weight_prefix + name, tensor
+            name = weight_prefix + name
+            # Coverage bookkeeping for the post-load invariant check; records
+            # exactly what the model's own loader was offered.
+            if (record := getattr(self, "_loaded_weight_names", None)) is not None:
+                record.add(name)
+            yield name, tensor
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         model.load_weights(self.get_all_weights(model_config, model))
+
+    @staticmethod
+    def _check_weight_coverage(model: nn.Module, loaded_names: set[str]) -> None:
+        """Report parameters that received no checkpoint tensor.
+
+        A name mismatch between the adapter map and the instantiated model used
+        to leave parameters at their uninitialized values while the load still
+        "succeeded". Fused parameters (``qkv_proj``, ``gate_up_proj``, ...) are
+        filled from their shards by the model's own loader and are therefore
+        covered by construction.
+        """
+        packed = getattr(model, "packed_modules_mapping", {}) or {}
+        # The adapter yields checkpoint-side names; the model's own loader maps
+        # them onto module names, so compare like with like.
+        mapper = getattr(model, "hf_to_vllm_mapper", None)
+        covered = (
+            set(mapper.apply_list(sorted(loaded_names))) if mapper else loaded_names
+        )
+        uncovered = []
+        for name, _ in model.named_parameters(remove_duplicate=False):
+            if name in covered:
+                continue
+            leaf = name.rsplit(".", 1)[0].rsplit(".", 1)[-1]
+            if leaf in packed:
+                continue
+            uncovered.append(name)
+        if uncovered:
+            logger.warning(
+                "GGUF load left %d parameters without weights (first %d): %s",
+                len(uncovered),
+                min(len(uncovered), 12),
+                uncovered[:12],
+            )
+        else:
+            logger.info(
+                "GGUF load covered every parameter (%d tensors)", len(loaded_names)
+            )
 
     @staticmethod
     def _start_load_sampler():
@@ -675,7 +734,13 @@ class GGUFModelLoader(BaseModelLoader):
                     adapter.bulk_experts, self._native_tensors
                 )
             finish = self._start_load_sampler()
-            self.load_weights(weight_model, model_config)
+            self._loaded_weight_names = set()
+            try:
+                self.load_weights(weight_model, model_config)
+            finally:
+                loaded_names = self._loaded_weight_names
+                del self._loaded_weight_names
+            self._check_weight_coverage(model, loaded_names)
             if multimodal_weights is not None:
                 loaded = multimodal_weights.load(model)
                 logger.info("Loaded %d multimodal safetensors weights", len(loaded))

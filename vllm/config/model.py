@@ -738,8 +738,16 @@ class ModelConfig:
                     "disable the cache with --mm-processor-cache-gb 0."
                 )
 
-        # Multimodal GGUF models must use original repo for mm processing
-        if is_gguf(self.tokenizer) and self.is_multimodal_model:
+        # Multimodal GGUF models must use original repo for mm processing.
+        # A native mmproj checkpoint is the exception: its vision tower and
+        # projector are GGUF tensors next to the backbone, so the GGUF tokenizer
+        # is the authoritative one and the mm processor is built from GGUF
+        # metadata (see Qwen3VLProcessingInfo) instead of an HF repository.
+        if (
+            is_gguf(self.tokenizer)
+            and self.is_multimodal_model
+            and getattr(self.hf_config, "gguf_native_mmproj", None) is None
+        ):
             raise ValueError(
                 "Loading a multimodal GGUF model needs to use original "
                 "tokenizer. Please specify the unquantized hf model's "
