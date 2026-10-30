@@ -85,6 +85,10 @@ class PrepareStoreOutput:
     keys_to_store: list[OffloadKey]
     store_spec: LoadStoreSpec
     evicted_keys: list[OffloadKey]
+    # Keys the manager was offered but could not admit this step. The caller must
+    # not treat them as stored-and-done: it retries them on a later step. Empty
+    # means every offered key was either stored now or already held.
+    deferred_keys: tuple[OffloadKey, ...] = ()
 
 
 @dataclass

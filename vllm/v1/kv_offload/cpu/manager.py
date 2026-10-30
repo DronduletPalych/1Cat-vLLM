@@ -52,6 +52,8 @@ class CPUOffloadingManager(OffloadingManager):
         max_tracker_size: int = 64_000,
         share_pages: bool = False,
         defer_inflight_lookup: bool = False,
+        group_label: str = "-",
+        partial_admit: bool = False,
     ):
         self.medium: str = CPULoadStoreSpec.medium()
         self._num_blocks: int = num_blocks
@@ -82,11 +84,90 @@ class CPUOffloadingManager(OffloadingManager):
         # idle engine unable to complete the write it is waiting on.
         self.defer_inflight_lookup: bool = defer_inflight_lookup
         self._keys_by_block: dict[int, set[OffloadKey]] = {}
+        # Store-admission diagnostics: label of the KV group this pool serves
+        # (empty for a shared-page pool) and how often the pool could not make
+        # room for a store.
+        self.group_label: str = group_label
+        # A grouped pool stores behind a fixed number of private slots. When the
+        # batch does not fit, admitting its leading part and letting the caller
+        # retry the tail keeps blocks flowing to the secondary tiers; a shared
+        # page pool keeps the all-or-nothing contract.
+        self.partial_admit: bool = partial_admit
+        self._admit_refusals: int = 0
+        self._admit_last_log: float = 0.0
 
     # --- block pool ---
 
     def _get_num_free_blocks(self) -> int:
         return len(self._free_list) + self._num_blocks - self._num_allocated_blocks
+
+    def _admit_composition(self, protected: set[OffloadKey]) -> tuple[int, int, int]:
+        """Count cached blocks by why they cannot be evicted (diagnostics only).
+
+        Returns (evictable, pinned, not_ready): ``pinned`` blocks are in use as
+        a transfer source (or not yet ready), ``not_ready`` are slots reserved
+        by an in-flight store/promotion, ``evictable`` are the LRU candidates
+        that are neither pinned nor protected by this store call.
+        """
+        evictable = pinned = not_ready = 0
+        for key, block in self._policy.iter_blocks():
+            if block.ref_cnt > 0:
+                pinned += 1
+            elif block.ref_cnt < 0:
+                not_ready += 1
+            elif key not in protected:
+                evictable += 1
+        return evictable, pinned, not_ready
+
+    def _log_admit_refusal(
+        self,
+        new: int,
+        need: int,
+        protected: set[OffloadKey],
+        reason: str,
+        admitted: int = 0,
+    ) -> None:
+        """Record a store batch the pool cannot fully admit, with its composition."""
+        self._admit_refusals += 1
+        now = time.monotonic()
+        if now - self._admit_last_log < 2.0:
+            return
+        self._admit_last_log = now
+        evictable, pinned, not_ready = self._admit_composition(protected)
+        logger.info(
+            "FS-ADMIT-REFUSE grp=%s reason=%s new=%d admitted=%d free=%d pool=%d "
+            "alloc=%d need_evict=%d evictable=%d pinned=%d not_ready=%d "
+            "protected=%d refusals=%d",
+            self.group_label,
+            reason,
+            new,
+            admitted,
+            self._get_num_free_blocks(),
+            self._num_blocks,
+            self._num_allocated_blocks,
+            need,
+            evictable,
+            pinned,
+            not_ready,
+            len(protected),
+            self._admit_refusals,
+        )
+
+    def _admit_capacity(self, protected: set[OffloadKey]) -> int:
+        """Keys this pool could accept right now: free slots plus evictable ones."""
+        evictable, _, _ = self._admit_composition(protected)
+        return self._get_num_free_blocks() + evictable
+
+    def pool_stats(self) -> tuple[int, int, int, int, int]:
+        """(pool, allocated, ready, pinned, not_ready) block counts, diagnostics only."""
+        ready, pinned, not_ready = self._admit_composition(set())
+        return (
+            self._num_blocks,
+            self._num_allocated_blocks,
+            ready,
+            pinned,
+            not_ready,
+        )
 
     def _allocate_blocks(self, keys: list[OffloadKey]) -> list[BlockStatus]:
         num_fresh = min(len(keys), self._num_blocks - self._num_allocated_blocks)
@@ -246,6 +327,16 @@ class CPUOffloadingManager(OffloadingManager):
             protected = set(keys)
             evicted = self._policy.evict(num_blocks_to_evict, protected)
             if evicted is None:
+                # A shared-page pool keeps its all-or-nothing contract: one page
+                # holds every KV group of a token block, so a partial batch would
+                # have to be re-derived per page. Only the per-key (grouped) pools
+                # admit partially; this layout is not used with Mamba hybrids.
+                self._log_admit_refusal(
+                    len(new_hashes),
+                    num_blocks_to_evict,
+                    protected,
+                    "shared-page pool full",
+                )
                 return None
             for key, block in evicted:
                 for k in list(self._keys_by_block.pop(block.block_id, {key})):
@@ -310,12 +401,46 @@ class CPUOffloadingManager(OffloadingManager):
 
         num_blocks_to_evict = len(keys_to_store) - self._get_num_free_blocks()
 
+        deferred: tuple[OffloadKey, ...] = ()
         to_evict: list[OffloadKey] = []
         if num_blocks_to_evict > 0:
             protected = set(keys)
             evicted = self._policy.evict(num_blocks_to_evict, protected)
             if evicted is None:
-                return None
+                requested = len(keys_to_store)
+                capacity = self._admit_capacity(protected) if self.partial_admit else 0
+                if capacity <= 0:
+                    self._log_admit_refusal(
+                        requested,
+                        num_blocks_to_evict,
+                        protected,
+                        "per-key pool full",
+                        0,
+                    )
+                    return None
+                # The pool cannot make room for the whole batch. Admit the
+                # leading part that fits and leave the rest to the caller's
+                # next attempt instead of refusing every key of the batch: a
+                # key without a host slot can never reach a secondary tier, so
+                # an all-or-nothing refusal loses the blocks the filesystem
+                # tier has room for.
+                deferred = tuple(keys_to_store[capacity:])
+                keys_to_store = keys_to_store[:capacity]
+                self._log_admit_refusal(
+                    requested,
+                    num_blocks_to_evict,
+                    protected,
+                    "per-key pool full, partial admit",
+                    len(keys_to_store),
+                )
+                num_blocks_to_evict = len(keys_to_store) - self._get_num_free_blocks()
+                evicted = (
+                    self._policy.evict(num_blocks_to_evict, protected)
+                    if num_blocks_to_evict > 0
+                    else []
+                )
+                if evicted is None:
+                    return None
             for key, block in evicted:
                 self._free_block(block)
                 to_evict.append(key)
@@ -343,6 +468,7 @@ class CPUOffloadingManager(OffloadingManager):
             keys_to_store=keys_to_store,
             store_spec=store_spec,
             evicted_keys=to_evict,
+            deferred_keys=deferred,
         )
 
     def complete_store(
@@ -449,14 +575,24 @@ class GroupedCPUOffloadingManager(OffloadingManager):
     def _bump_group(self, group_idx: int, slot: int, value: int) -> None:
         if not self._stats_enabled:
             return
-        acc = self._stats.setdefault(group_idx, [0, 0, 0])
+        acc = self._stats.setdefault(group_idx, [0, 0, 0, 0])
         acc[slot] += value
         now = time.monotonic()
         if now - self._stats_last >= 10.0:
             self._stats_last = now
             logger.info(
-                "GROUPED-STORE group_in_out_ev=%s",
+                "GROUPED-STORE group_in_out_ev_ref=%s",
                 {g: tuple(v) for g, v in sorted(self._stats.items())},
+            )
+            # (pool, allocated, ready, pinned, not_ready) per group: distinguishes
+            # a pool that is full of in-flight transfers from one that is full of
+            # live cache entries, and shows whether a slot ever comes back.
+            logger.info(
+                "FS-POOL group_pool_alloc_ready_pinned_notready=%s",
+                {
+                    g: m.pool_stats()  # type: ignore[attr-defined]
+                    for g, m in sorted(self.managers.items())
+                },
             )
 
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
@@ -522,16 +658,21 @@ class GroupedCPUOffloadingManager(OffloadingManager):
         # zero. Dropping it made every tier lookup miss.
         block_ids: dict[OffloadKey, int] = {}
         evicted_keys: list[OffloadKey] = []
+        deferred_keys: list[OffloadKey] = []
+        refused_groups: list[int] = []
         for group_idx, group_keys in self._partition(keys).items():
             self._bump_group(group_idx, 0, len(group_keys))
             output = self.managers[group_idx].prepare_store(group_keys, req_context)
             if output is None:
-                # The scheduler advances every group's store cursor on success.
-                # Release only this call's new reservations so all groups retry.
-                # Already performed evictions are not undone; pre-existing
-                # in-flight stores must not be cancelled.
-                self.complete_store(list(block_ids), req_context, success=False)
-                return None
+                # This pool cannot take any of its keys right now. Keep the
+                # other groups' admissions instead of cancelling the batch: a
+                # block that never gets a host slot never reaches a secondary
+                # tier either, so one starved group must not drop the blocks
+                # that do fit. The caller retries the refused keys.
+                refused_groups.append(group_idx)
+                self._bump_group(group_idx, 3, 1)
+                deferred_keys.extend(group_keys)
+                continue
             assert isinstance(output.store_spec, CPULoadStoreSpec)
             self._bump_group(group_idx, 1, len(output.keys_to_store))
             self._bump_group(group_idx, 2, len(output.evicted_keys))
@@ -539,11 +680,18 @@ class GroupedCPUOffloadingManager(OffloadingManager):
                 zip(output.keys_to_store, map(int, output.store_spec.block_ids))
             )
             evicted_keys.extend(output.evicted_keys)
-        stored = [key for key in keys if key in block_ids]
+            deferred_keys.extend(output.deferred_keys)
+        if refused_groups and not block_ids:
+            # Nothing was admitted anywhere: report a refusal so the caller
+            # retries the batch instead of being told every key is present.
+            return None
+        stored_set = set(block_ids)
+        stored = [key for key in keys if key in stored_set]
         return PrepareStoreOutput(
             keys_to_store=stored,
             store_spec=CPULoadStoreSpec([block_ids[key] for key in stored]),
             evicted_keys=evicted_keys,
+            deferred_keys=tuple(deferred_keys),
         )
 
     def complete_store(
