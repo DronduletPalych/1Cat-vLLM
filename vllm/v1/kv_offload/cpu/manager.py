@@ -3,7 +3,7 @@
 import os
 import time
 from collections import OrderedDict
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from typing import Literal
 
 from vllm.v1.kv_offload.base import (
@@ -26,6 +26,13 @@ from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+# A cascade handler receives the blocks the replacement policy just evicted and
+# returns the keys whose slot it now owns: their data is copied elsewhere before
+# the slot may be reused. Every other victim's slot is freed immediately.
+EvictionCascade = Callable[
+    [Sequence[tuple[OffloadKey, BlockStatus]], ReqContext], Collection[OffloadKey]
+]
 
 _CACHE_POLICIES: dict[str, type[CachePolicy]] = {
     "lru": LRUCachePolicy,
@@ -95,6 +102,74 @@ class CPUOffloadingManager(OffloadingManager):
         self.partial_admit: bool = partial_admit
         self._admit_refusals: int = 0
         self._admit_last_log: float = 0.0
+        # Slots whose data is being copied out of the pool before reuse (see
+        # set_eviction_cascade). They are out of the policy and out of the free
+        # list: the slot cannot be reallocated until release_held_blocks().
+        self._eviction_cascade: EvictionCascade | None = None
+        self._held_block_ids: set[int] = set()
+        self._cascaded_total: int = 0
+
+    # --- eviction cascade ---
+
+    def set_eviction_cascade(self, cascade: EvictionCascade) -> None:
+        """Install the handler that preserves victims before their slot is freed.
+
+        Without one, an evicted block is simply dropped (the CPU tier is the
+        last tier). With one, the policy's victims are handed to the handler
+        first; the keys it returns keep their slot until
+        release_held_blocks() puts it back on the free list.
+        """
+        self._eviction_cascade = cascade
+
+    def _release_evicted(
+        self,
+        evicted: Sequence[tuple[OffloadKey, BlockStatus]],
+        req_context: ReqContext,
+    ) -> tuple[list[tuple[OffloadKey, BlockStatus]], list[tuple[OffloadKey, BlockStatus]]]:
+        """Split policy victims into (slot freed now, slot held by the cascade).
+
+        The policy has already unlinked every victim, so a held block is no
+        longer visible to lookup()/prepare_load(); only its memory stays alive,
+        which is exactly what a secondary tier needs to read it.
+        """
+        held_keys: set[OffloadKey] = set()
+        if self._eviction_cascade is not None and evicted:
+            held_keys = set(self._eviction_cascade(evicted, req_context))
+        freed: list[tuple[OffloadKey, BlockStatus]] = []
+        held: list[tuple[OffloadKey, BlockStatus]] = []
+        for key, block in evicted:
+            if key in held_keys:
+                self._held_block_ids.add(int(block.block_id))
+                held.append((key, block))
+                continue
+            self._free_block(block)
+            freed.append((key, block))
+        if held:
+            self._cascaded_total += len(held)
+        return freed, held
+
+    def release_held_blocks(self, block_ids: Iterable[int]) -> int:
+        """Return slots held by an eviction cascade to the free list.
+
+        Idempotent: an id is released once, and only if it is actually held, so
+        a late completion after reset_cache() cannot free a foreign slot.
+        """
+        released = 0
+        for block_id in block_ids:
+            block_id = int(block_id)
+            if block_id in self._held_block_ids:
+                self._held_block_ids.discard(block_id)
+                self._free_list.append(block_id)
+                released += 1
+        return released
+
+    def held_blocks(self) -> int:
+        """Slots currently pinned by an in-flight eviction copy."""
+        return len(self._held_block_ids)
+
+    def free_slots(self) -> int:
+        """Slots that can be allocated right now (see _get_num_free_blocks)."""
+        return self._get_num_free_blocks()
 
     # --- block pool ---
 
@@ -158,8 +233,8 @@ class CPUOffloadingManager(OffloadingManager):
         evictable, _, _ = self._admit_composition(protected)
         return self._get_num_free_blocks() + evictable
 
-    def pool_stats(self) -> tuple[int, int, int, int, int]:
-        """(pool, allocated, ready, pinned, not_ready) block counts, diagnostics only."""
+    def pool_stats(self) -> tuple[int, int, int, int, int, int]:
+        """(pool, allocated, ready, pinned, not_ready, held) counts, diagnostics only."""
         ready, pinned, not_ready = self._admit_composition(set())
         return (
             self._num_blocks,
@@ -167,6 +242,7 @@ class CPUOffloadingManager(OffloadingManager):
             ready,
             pinned,
             not_ready,
+            len(self._held_block_ids),
         )
 
     def _allocate_blocks(self, keys: list[OffloadKey]) -> list[BlockStatus]:
@@ -283,7 +359,7 @@ class CPUOffloadingManager(OffloadingManager):
             keys = [k for k in keys if self.counts.get(k, 0) >= self.store_threshold]
 
         if not self.share_pages:
-            return self._prepare_store_per_key(keys)
+            return self._prepare_store_per_key(keys, req_context)
 
         # A CPU page holds every KV group of one token block. Group the keys by
         # block hash so all groups of a block share one page and one block id.
@@ -321,6 +397,7 @@ class CPUOffloadingManager(OffloadingManager):
         num_blocks_to_evict = len(new_hashes) - self._get_num_free_blocks()
 
         to_evict: list[OffloadKey] = []
+        cascaded: list[OffloadKey] = []
         if num_blocks_to_evict > 0:
             # Blocks from the original input are excluded from eviction candidates:
             # a block that was already stored must remain in the cache after this call.
@@ -342,8 +419,21 @@ class CPUOffloadingManager(OffloadingManager):
                 for k in list(self._keys_by_block.pop(block.block_id, {key})):
                     if k != key and self._policy.get(k) is not None:
                         self._policy.remove(k)
-                self._free_block(block)
-                to_evict.append(key)
+            freed, held = self._release_evicted(evicted, req_context)
+            to_evict = [key for key, _ in freed]
+            cascaded = [key for key, _ in held]
+            if len(cascaded) and self._get_num_free_blocks() < len(new_hashes):
+                # Victims are being copied out and their slots are not free yet.
+                # Refusing keeps the all-or-nothing contract and loses nothing:
+                # the copy still lands, the caller retries this batch.
+                self._log_admit_refusal(
+                    len(new_hashes),
+                    num_blocks_to_evict,
+                    protected,
+                    "shared-page victims held by eviction cascade",
+                    len(freed),
+                )
+                return None
 
         if to_evict and self.events is not None:
             self.events.append(
@@ -383,10 +473,11 @@ class CPUOffloadingManager(OffloadingManager):
             keys_to_store=keys_to_store,
             store_spec=store_spec,
             evicted_keys=to_evict,
+            cascaded_keys=tuple(cascaded),
         )
 
     def _prepare_store_per_key(
-        self, keys: Collection[OffloadKey]
+        self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> PrepareStoreOutput | None:
         # Grouped pools give every key its own slot: block ids address disjoint
         # per-group tensors, so keys must never be merged by block hash.
@@ -403,6 +494,7 @@ class CPUOffloadingManager(OffloadingManager):
 
         deferred: tuple[OffloadKey, ...] = ()
         to_evict: list[OffloadKey] = []
+        cascaded: list[OffloadKey] = []
         if num_blocks_to_evict > 0:
             protected = set(keys)
             evicted = self._policy.evict(num_blocks_to_evict, protected)
@@ -441,9 +533,33 @@ class CPUOffloadingManager(OffloadingManager):
                 )
                 if evicted is None:
                     return None
-            for key, block in evicted:
-                self._free_block(block)
-                to_evict.append(key)
+            # Every victim is either freed now or handed to the eviction cascade,
+            # which copies it to the slower tier before the slot is reusable.
+            freed, held = self._release_evicted(evicted, req_context)
+            to_evict = [key for key, _ in freed]
+            cascaded = [key for key, _ in held]
+
+        # Slots held by the cascade are not free until their copy lands, so this
+        # call may have less room than the batch needs. Keep the caller's order,
+        # store the leading part and defer the tail: the scheduler retries a
+        # deferred key on a later step and never advances past it.
+        free = self._get_num_free_blocks()
+        if free == 0 and keys_to_store:
+            # Every slot is either cached or held by an eviction copy. Refuse the
+            # batch instead of returning an empty store: the caller retries it,
+            # while an empty keys_to_store would tell the scheduler there is
+            # nothing left to store and the blocks would never be offered again.
+            self._log_admit_refusal(
+                len(keys_to_store) + len(deferred),
+                num_blocks_to_evict,
+                set(keys),
+                "all slots held by eviction copies",
+                0,
+            )
+            return None
+        if free < len(keys_to_store):
+            deferred = tuple(keys_to_store[free:]) + deferred
+            keys_to_store = keys_to_store[:free]
 
         if to_evict and self.events is not None:
             self.events.append(
@@ -469,6 +585,7 @@ class CPUOffloadingManager(OffloadingManager):
             store_spec=store_spec,
             evicted_keys=to_evict,
             deferred_keys=deferred,
+            cascaded_keys=tuple(cascaded),
         )
 
     def complete_store(
@@ -540,6 +657,9 @@ class CPUOffloadingManager(OffloadingManager):
 
         self._free_list.clear()
         self._num_allocated_blocks = 0
+        # A reset invalidates every slot, including those an eviction cascade
+        # still holds; a late completion must not free a slot of the new pool.
+        self._held_block_ids.clear()
 
     def take_events(self) -> Iterable[OffloadingEvent]:
         if self.events is not None:
@@ -569,31 +689,100 @@ class GroupedCPUOffloadingManager(OffloadingManager):
         self._dropped_stateless_keys = 0
         self._gate_info: dict = {}
         self._stats_enabled = os.environ.get("VLLM_TIER_STATS") == "1"
+        # Per group: [in, adm, out, lost, ev, ref].
+        #   in   — blocks offered to this group's prepare_store
+        #   adm  — blocks admitted into the group's primary pool this call
+        #   out  — blocks the secondary tier CONFIRMED as written
+        #   lost — blocks that left the primary pool without that confirmation
+        #   ev   — blocks whose primary slot was released by an eviction
+        #   ref  — store batches the group refused (retried by the caller)
         self._stats: dict[int, list[int]] = {}
         self._stats_last = time.monotonic()
+        # Per group: [ram_hit_lookups, fs_hit_lookups]. Hits answered by the
+        # primary pool and hits answered by a secondary tier are counted apart:
+        # an aggregate external-hit number hides a tier that does nothing.
+        self._hit_blocks: dict[int, list[int]] = {}
+        self._hit_last = time.monotonic()
+        self._hit_taken: dict[int, tuple[int, int]] = {}
+        for group_idx, manager in managers.items():
+            store_sink = getattr(manager, "set_store_outcome_sink", None)
+            if store_sink is not None:
+                store_sink(
+                    lambda confirmed, lost, g=group_idx: self._on_store_outcome(
+                        g, confirmed, lost
+                    )
+                )
+            hit_sink = getattr(manager, "set_hit_sink", None)
+            if hit_sink is not None:
+                hit_sink(lambda tier, g=group_idx: self._on_hit(g, tier))
+
+    def _on_store_outcome(self, group_idx: int, confirmed: int, lost: int) -> None:
+        """Count blocks a secondary write confirmed (or dropped) for a group."""
+        if confirmed:
+            self._stats.setdefault(group_idx, [0, 0, 0, 0, 0, 0])[2] += confirmed
+        if lost:
+            self._stats.setdefault(group_idx, [0, 0, 0, 0, 0, 0])[3] += lost
+        self._maybe_log_stats()
+
+    def _on_hit(self, group_idx: int, tier: str) -> None:
+        acc = self._hit_blocks.setdefault(group_idx, [0, 0])
+        acc[0 if tier == "ram" else 1] += 1
+        self._maybe_log_hits()
+
+    def take_hit_stats(self) -> dict[int, tuple[int, int]]:
+        """Per-group (ram, fs) hit-lookup counts since the previous call."""
+        deltas: dict[int, tuple[int, int]] = {}
+        for group_idx, (ram, fs) in self._hit_blocks.items():
+            prev_ram, prev_fs = self._hit_taken.get(group_idx, (0, 0))
+            if ram != prev_ram or fs != prev_fs:
+                deltas[group_idx] = (ram - prev_ram, fs - prev_fs)
+                self._hit_taken[group_idx] = (ram, fs)
+        return deltas
 
     def _bump_group(self, group_idx: int, slot: int, value: int) -> None:
         if not self._stats_enabled:
             return
-        acc = self._stats.setdefault(group_idx, [0, 0, 0, 0])
-        acc[slot] += value
+        self._stats.setdefault(group_idx, [0, 0, 0, 0, 0, 0])[slot] += value
+        self._maybe_log_stats()
+
+    def _maybe_log_stats(self, force: bool = False) -> None:
+        if not self._stats_enabled:
+            return
         now = time.monotonic()
-        if now - self._stats_last >= 10.0:
-            self._stats_last = now
-            logger.info(
-                "GROUPED-STORE group_in_out_ev_ref=%s",
-                {g: tuple(v) for g, v in sorted(self._stats.items())},
-            )
-            # (pool, allocated, ready, pinned, not_ready) per group: distinguishes
-            # a pool that is full of in-flight transfers from one that is full of
-            # live cache entries, and shows whether a slot ever comes back.
-            logger.info(
-                "FS-POOL group_pool_alloc_ready_pinned_notready=%s",
-                {
-                    g: m.pool_stats()  # type: ignore[attr-defined]
-                    for g, m in sorted(self.managers.items())
-                },
-            )
+        if not force and now - self._stats_last < 10.0:
+            return
+        self._stats_last = now
+        logger.info(
+            "GROUPED-STORE group_in_adm_out_lost_ev_ref=%s",
+            {g: tuple(v) for g, v in sorted(self._stats.items())},
+        )
+        # (pool, allocated, ready, pinned, not_ready, held) per group:
+        # distinguishes a pool that is full of in-flight transfers from one that
+        # is full of live cache entries, is held by an eviction copy, or shows
+        # whether a slot ever comes back.
+        logger.info(
+            "FS-POOL group_pool_alloc_ready_pinned_notready_held=%s",
+            {
+                g: m.pool_stats()  # type: ignore[attr-defined]
+                for g, m in sorted(self.managers.items())
+            },
+        )
+
+    def _maybe_log_hits(self, force: bool = False) -> None:
+        if not self._stats_enabled:
+            return
+        now = time.monotonic()
+        if not force and now - self._hit_last < 10.0:
+            return
+        self._hit_last = now
+        ram_total = sum(v[0] for v in self._hit_blocks.values())
+        fs_total = sum(v[1] for v in self._hit_blocks.values())
+        logger.info(
+            "GROUPED-HITS group_ram_fs_hit_blocks=%s ram_hits=%d fs_hits=%d",
+            {g: tuple(v) for g, v in sorted(self._hit_blocks.items())},
+            ram_total,
+            fs_total,
+        )
 
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         contexts = [m.on_new_request(req_context) for m in self.managers.values()]
@@ -658,6 +847,7 @@ class GroupedCPUOffloadingManager(OffloadingManager):
         # zero. Dropping it made every tier lookup miss.
         block_ids: dict[OffloadKey, int] = {}
         evicted_keys: list[OffloadKey] = []
+        cascaded_keys: list[OffloadKey] = []
         deferred_keys: list[OffloadKey] = []
         refused_groups: list[int] = []
         for group_idx, group_keys in self._partition(keys).items():
@@ -670,16 +860,17 @@ class GroupedCPUOffloadingManager(OffloadingManager):
                 # tier either, so one starved group must not drop the blocks
                 # that do fit. The caller retries the refused keys.
                 refused_groups.append(group_idx)
-                self._bump_group(group_idx, 3, 1)
+                self._bump_group(group_idx, 5, 1)
                 deferred_keys.extend(group_keys)
                 continue
             assert isinstance(output.store_spec, CPULoadStoreSpec)
             self._bump_group(group_idx, 1, len(output.keys_to_store))
-            self._bump_group(group_idx, 2, len(output.evicted_keys))
+            self._bump_group(group_idx, 4, len(output.evicted_keys))
             block_ids.update(
                 zip(output.keys_to_store, map(int, output.store_spec.block_ids))
             )
             evicted_keys.extend(output.evicted_keys)
+            cascaded_keys.extend(output.cascaded_keys)
             deferred_keys.extend(output.deferred_keys)
         if refused_groups and not block_ids:
             # Nothing was admitted anywhere: report a refusal so the caller
@@ -692,6 +883,7 @@ class GroupedCPUOffloadingManager(OffloadingManager):
             store_spec=CPULoadStoreSpec([block_ids[key] for key in stored]),
             evicted_keys=evicted_keys,
             deferred_keys=tuple(deferred_keys),
+            cascaded_keys=tuple(cascaded_keys),
         )
 
     def complete_store(

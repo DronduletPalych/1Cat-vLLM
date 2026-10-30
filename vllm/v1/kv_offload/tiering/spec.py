@@ -159,6 +159,14 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     cache_policy=self.eviction_policy,  # type: ignore[arg-type]
                     enable_events=enable_events,
                     mmap_region=region,
+                    # Grouped pools address disjoint per-group slots, so a batch
+                    # bigger than the pool may be admitted in part instead of
+                    # being refused whole: the head is stored now, the tail is
+                    # deferred and retried. Without it a request whose batch
+                    # exceeds the (small) per-group slot count could never
+                    # offload anything.
+                    partial_admit=True,
+                    group_label=str(group),
                 )
                 cleanup.callback(primary.shutdown)
                 tiers = []

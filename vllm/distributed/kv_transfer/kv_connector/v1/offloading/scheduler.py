@@ -1649,6 +1649,7 @@ class OffloadingConnectorScheduler:
                 pinned,
                 len(self._jobs),
             )
+            self._log_hit_split()
         for event in self.manager.take_events():
             block_hashes = [get_offload_block_hash(key) for key in event.keys]
             if event.removed:
@@ -1663,6 +1664,37 @@ class OffloadingConnectorScheduler:
                     medium=event.medium,
                     lora_name=None,
                 )
+
+    def _log_hit_split(self) -> None:
+        """Log external hits split by the tier that answered them.
+
+        A single external-hit percentage cannot tell a working FS tier from an
+        idle one: the RAM tier answers most of it. Counts are per KV group, in
+        blocks and in tokens (block size differs per group).
+        """
+        take = getattr(self.manager, "take_hit_stats", None)
+        if take is None:
+            return
+        deltas = take()
+        if not deltas:
+            return
+        ram_blocks = fs_blocks = ram_tokens = fs_tokens = 0
+        for group_idx, (ram, fs) in deltas.items():
+            config = self._group_config_by_idx.get(group_idx)
+            block_tokens = config.offloaded_block_size if config is not None else 0
+            ram_blocks += ram
+            fs_blocks += fs
+            ram_tokens += ram * block_tokens
+            fs_tokens += fs * block_tokens
+        logger.info(
+            "OFFLOAD-HIT-SPLIT group_ram_fs_blocks=%s ram_blocks=%d fs_blocks=%d "
+            "ram_tokens=%d fs_tokens=%d",
+            {g: tuple(v) for g, v in sorted(deltas.items())},
+            ram_blocks,
+            fs_blocks,
+            ram_tokens,
+            fs_tokens,
+        )
 
     def reset_cache(self) -> None:
         """Reset the offloading manager cache, evicting all stored blocks."""

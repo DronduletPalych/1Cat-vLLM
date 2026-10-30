@@ -8,6 +8,7 @@ It validates the scheduler/storage seam, not CUDA registration or GPU transfers.
 
 import json
 import multiprocessing
+import os
 import time
 import uuid
 from pathlib import Path
@@ -61,13 +62,22 @@ def _spec():
     )
 
 
+def _instance_id():
+    # The spawn child must use the same /dev/shm mapping names as the parent
+    # test, so the test can wipe leftovers before each phase instead of
+    # inheriting a dead process' file.
+    return os.environ.get("GROUPED_FS_TEST_INSTANCE") or (
+        f"grouped-fs-test-{uuid.uuid4().hex}"
+    )
+
+
 def _build(root):
     from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
 
     spec = object.__new__(TieringOffloadingSpec)
     config = _spec()
     spec.vllm_config = config.vllm_config
-    spec.vllm_config.instance_id = f"grouped-fs-test-{uuid.uuid4().hex}"
+    spec.vllm_config.instance_id = _instance_id()
     spec.vllm_config.parallel_config.world_size = WORLD_SIZE
     spec.vllm_config.kv_events_config = SimpleNamespace(enable_kv_cache_events=True)
     spec.kv_cache_config = config.kv_cache_config
@@ -125,6 +135,30 @@ def _write_rows(manager, output, payloads):
     _settle(manager)
 
 
+def _store_all(manager, keys, payloads, attempts=6):
+    """Store keys into a pool that must copy victims out before reusing a slot.
+
+    With write-through eviction a full pool refuses the batch for one step (the
+    victim is on its way to the FS tier) and accepts the retry afterwards, so a
+    caller has to retry instead of assuming one step per batch.
+    """
+    block_ids: dict = {}
+    pending = list(keys)
+    for _ in range(attempts):
+        output = manager.prepare_store(pending, CTX)
+        if output is not None and output.keys_to_store:
+            for key, block_id in zip(
+                output.keys_to_store, output.store_spec.block_ids
+            ):
+                block_ids[key] = int(block_id)
+            _write_rows(manager, output, payloads)
+            pending = [key for key in pending if key not in block_ids]
+        _settle(manager)
+        if not pending:
+            break
+    return block_ids
+
+
 def _phase(root, phase):
     """Runs in a fresh spawn process, so no cache index or mapping is inherited."""
     manager = _build(root)
@@ -174,22 +208,24 @@ def _phase(root, phase):
                         view[int(bid) * size : (int(bid) + 1) * size]
                     ) == _payload(g)
             manager.complete_load(keys, CTX)
-            # Fill beyond capacity; old filler rows are evicted through standard LRU.
+            # Fill beyond capacity. A victim's slot is now copied to the FS tier
+            # before it is released, so a full pool refuses the batch for this
+            # step and the caller retries once the copy lands.
             manager.touch(keys, CTX)
-            pressure = manager.prepare_store([_key(g, 3) for g in GROUP_PAGES], CTX)
-            assert set(pressure.evicted_keys) == (
-                {_key(2, 2)}
-                if phase == "corrupt"
-                else {_key(g, 2) for g in GROUP_PAGES}
-            )
-            assert list(pressure.store_spec.block_ids) == (
-                [1, 0] if phase == "corrupt" else [0, 0]
-            )
-            _write_rows(
+            pressure_keys = [_key(g, 3) for g in GROUP_PAGES]
+            stored_ids = _store_all(
                 manager,
-                pressure,
+                pressure_keys,
                 {g: bytes([100]) * len(_payload(g)) for g in GROUP_PAGES},
             )
+            assert set(stored_ids) == set(pressure_keys)
+            # Nothing was dropped: every old filler row is either still in the
+            # RAM tier or persisted in the FS tier.
+            for g in GROUP_PAGES:
+                filler_key = _key(g, 2)
+                assert manager.managers[g].primary_tier.contains(
+                    filler_key
+                ) or manager.managers[g].secondary_tiers[0].lookup(filler_key, CTX)
         manager.on_request_finished(CTX)
         paths += [
             m.primary_tier._mmap_region.mmap_path for m in manager.managers.values()
@@ -203,14 +239,22 @@ def _phase(root, phase):
 
 
 @pytest.mark.parametrize("corrupt", [False, True])
-def test_fs_groups_survive_process_restart(tmp_path, corrupt):
+def test_fs_groups_survive_process_restart(tmp_path, monkeypatch, corrupt):
+    # Per-test FS root and /dev/shm prefix: neither the rows of an earlier test
+    # nor a dead process' mmap file can leak into this restart proof.
+    root = tmp_path / f"fs-corrupt-{corrupt}"
+    root.mkdir()
+    instance = f"grouped-fs-test-{uuid.uuid4().hex}"
+    monkeypatch.setenv("GROUPED_FS_TEST_INSTANCE", instance)
+    for stale in Path("/dev/shm").glob(f"vllm_offload_{instance}*.mmap"):
+        stale.unlink()
     for phase in ("write", "corrupt" if corrupt else "read"):
         if phase == "corrupt":
-            files = list(tmp_path.glob("**/*_g0/*.bin"))
+            files = list(root.glob("**/*_g0/*.bin"))
             assert len(files) == 1
             files[0].write_bytes(b"truncated")
         process = multiprocessing.get_context("spawn").Process(
-            target=_phase, args=(str(tmp_path), phase)
+            target=_phase, args=(str(root), phase)
         )
         process.start()
         process.join(60)
@@ -219,7 +263,7 @@ def test_fs_groups_survive_process_restart(tmp_path, corrupt):
             process.join(10)
             pytest.fail(f"{phase} process did not finish")
         assert process.exitcode == 0
-        assert json.loads((tmp_path / f"{phase}.json").read_text())["pass"]
+        assert json.loads((root / f"{phase}.json").read_text())["pass"]
 
 
 def test_group_routing_forwards_all_lifecycle_hooks():
@@ -420,3 +464,67 @@ def test_scheduler_unlinks_region_created_by_worker():
     finally:
         worker.cleanup()
         scheduler.cleanup()
+
+
+def _ram_only_group(num_blocks):
+    """One group's tiering manager with no secondary tier: RAM slots only."""
+    from vllm.v1.kv_offload.tiering.manager import (
+        CPUPrimaryTierOffloadingManager,
+        TieringOffloadingManager,
+    )
+
+    class _Region:
+        def __init__(self, blocks):
+            self._view = memoryview(bytearray(blocks * 64))
+
+        def create_kv_memoryview(self):
+            return self._view
+
+        def cleanup(self):
+            return None
+
+    primary = CPUPrimaryTierOffloadingManager(
+        num_blocks=num_blocks,
+        mmap_region=_Region(num_blocks),
+        partial_admit=True,
+        group_label="ram-only",
+    )
+    return TieringOffloadingManager(primary_tier=primary, secondary_tiers=[])
+
+
+def test_grouped_pool_defers_the_tail_of_an_oversized_batch():
+    """A grouped pool admits the head of a batch and reports the tail as deferred.
+
+    A grouped pool has few slots per group. Without partial admission a batch
+    larger than the pool is refused whole, so a long request never offloads
+    anything; with it the head is stored now and the tail is offered again on
+    the caller's next step instead of being dropped.
+    """
+    manager = GroupedCPUOffloadingManager(
+        {0: _ram_only_group(1), 2: _ram_only_group(1)}
+    )
+    manager.on_new_request(CTX)
+    try:
+        first = manager.prepare_store([_key(g) for g in GROUP_PAGES], CTX)
+        assert first is not None
+        assert set(first.keys_to_store) == {_key(g) for g in GROUP_PAGES}
+        assert not first.deferred_keys
+        manager.complete_store(first.keys_to_store, CTX)
+
+        # Every group's single slot is taken: a two-key batch per group can
+        # only admit its head, and the tail must come back as deferred.
+        batch = [_key(g, n) for g in GROUP_PAGES for n in (2, 3)]
+        second = manager.prepare_store(batch, CTX)
+        assert second is not None
+        assert set(second.keys_to_store) == {_key(g, 2) for g in GROUP_PAGES}
+        assert set(second.deferred_keys) == {_key(g, 3) for g in GROUP_PAGES}
+        manager.complete_store(second.keys_to_store, CTX)
+
+        # The deferred keys are accepted on the retry instead of vanishing.
+        third = manager.prepare_store(list(second.deferred_keys), CTX)
+        assert third is not None
+        assert set(third.keys_to_store) == {_key(g, 3) for g in GROUP_PAGES}
+        assert not third.deferred_keys
+    finally:
+        manager.on_request_finished(CTX)
+        manager.shutdown()
