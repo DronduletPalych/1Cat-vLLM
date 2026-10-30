@@ -5,6 +5,7 @@
 from functools import cache
 from os import PathLike
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import gguf
 import regex as re
@@ -16,7 +17,15 @@ from vllm.logger import init_logger
 
 from .repo_utils import list_filtered_repo_files
 
+if TYPE_CHECKING:
+    from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5VisionConfig
+
 logger = init_logger(__name__)
+
+# llama.cpp writes Qwen3-VL style mmproj files with this projector type; the
+# values map one-to-one onto Qwen3_5VisionConfig.
+_QWEN35_MMPROJ_PROJECTOR = "qwen3vl_merger"
+_QWEN35_MULTIMODAL_ARCHITECTURE = "Qwen3_5ForConditionalGeneration"
 
 
 @cache
@@ -259,6 +268,107 @@ def extract_vision_config_from_gguf(mmproj_path: str) -> "SiglipVisionConfig | N
     return config
 
 
+def _qwen35_vision_config_from_mmproj(mmproj_path: str | Path) -> "Qwen3_5VisionConfig":
+    """Build a Qwen3.5 vision config from ``clip`` mmproj GGUF metadata.
+
+    The mmproj carries the whole vision tower description (depth, width, patch
+    geometry, projection width) plus the CLIP normalization constants, so the
+    configuration is derived from the file and never guessed from defaults.
+    """
+    from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5VisionConfig
+    from vllm.transformers_utils.gguf_config import read_gguf_metadata
+
+    metadata = read_gguf_metadata(mmproj_path)
+    projector = metadata.get("clip.projector_type")
+    if projector != _QWEN35_MMPROJ_PROJECTOR:
+        raise ValueError(
+            f"Unsupported Qwen3.5 mmproj projector {projector!r} in {mmproj_path}; "
+            f"expected {_QWEN35_MMPROJ_PROJECTOR!r}"
+        )
+
+    def required(key: str):
+        value = metadata.get(f"clip.vision.{key}")
+        if value is None:
+            raise ValueError(
+                f"Missing required mmproj metadata field clip.vision.{key}"
+            )
+        return value
+
+    patch_size = int(required("patch_size"))
+    image_size = int(required("image_size"))
+    config = Qwen3_5VisionConfig(
+        depth=int(required("block_count")),
+        hidden_size=int(required("embedding_length")),
+        intermediate_size=int(required("feed_forward_length")),
+        num_heads=int(required("attention.head_count")),
+        patch_size=patch_size,
+        spatial_merge_size=int(required("spatial_merge_size")),
+        temporal_patch_size=int(metadata.get("clip.vision.temporal_patch_size", 2)),
+        out_hidden_size=int(required("projection_dim")),
+        num_position_embeddings=(image_size // patch_size) ** 2,
+        hidden_act="gelu_pytorch_tanh",
+        in_channels=int(metadata.get("clip.vision.in_channels", 3)),
+    )
+    # Normalization travels with the vision config so the GGUF-native image
+    # processor can preprocess without an HF repository. Qwen3_5VisionConfig has
+    # no dedicated fields for them; both are plain config attributes.
+    config.image_mean = [float(v) for v in required("image_mean")]
+    config.image_std = [float(v) for v in required("image_std")]
+    config.layer_norm_eps = float(
+        metadata.get("clip.vision.attention.layer_norm_epsilon", 1e-6)
+    )
+    return config
+
+
+def _qwen35_config_from_gguf(
+    model: str, hf_config: PretrainedConfig
+) -> PretrainedConfig:
+    """Promote a text-only Qwen3.5 GGUF config to its multimodal variant.
+
+    The backbone GGUF is honestly text-only: the vision tower and projector live
+    in the sibling ``clip`` mmproj, so the multimodal architecture exists only
+    once that file is present.
+    """
+    from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config
+    from vllm.transformers_utils.gguf_config import read_gguf_metadata
+
+    mmproj_path = detect_gguf_multimodal(model)
+    if mmproj_path is None:
+        return hf_config
+
+    tokens = read_gguf_metadata(model).get("tokenizer.ggml.tokens")
+    if not tokens:
+        raise ValueError(
+            f"Multimodal GGUF model {model} has no tokenizer.ggml.tokens; "
+            "its special-token ids cannot be resolved"
+        )
+
+    def token_id(token: str) -> int:
+        try:
+            return tokens.index(token)
+        except ValueError:
+            raise ValueError(
+                f"GGUF vocabulary of {model} has no {token} token; "
+                "it cannot describe a Qwen3.5 multimodal prompt"
+            ) from None
+
+    config = Qwen3_5Config(
+        text_config=hf_config,
+        vision_config=_qwen35_vision_config_from_mmproj(mmproj_path),
+        image_token_id=token_id("<|image_pad|>"),
+        video_token_id=token_id("<|video_pad|>"),
+        vision_start_token_id=token_id("<|vision_start|>"),
+        vision_end_token_id=token_id("<|vision_end|>"),
+        tie_word_embeddings=bool(getattr(hf_config, "tie_word_embeddings", False)),
+        architectures=[_QWEN35_MULTIMODAL_ARCHITECTURE],
+    )
+    # Marker consumed by ModelConfig (GGUF tokenizer is authoritative for this
+    # checkpoint) and by the multimodal processor (build it from GGUF metadata
+    # instead of an HF repository).
+    config.gguf_native_mmproj = str(mmproj_path)
+    return config
+
+
 def maybe_patch_hf_config_from_gguf(
     model: str,
     hf_config: PretrainedConfig,
@@ -283,6 +393,11 @@ def maybe_patch_hf_config_from_gguf(
     # Patch multimodal config if mmproj.gguf exists
     mmproj_path = detect_gguf_multimodal(model)
     if mmproj_path is not None:
+        if getattr(hf_config, "model_type", None) == "qwen3_5_text":
+            # The Qwen3.5 backbone GGUF carries only language weights; the clip
+            # mmproj supplies the vision tower and projector.
+            return _qwen35_config_from_gguf(model, hf_config)
+
         vision_config = extract_vision_config_from_gguf(str(mmproj_path))
 
         # Create HF config for Gemma3 multimodal

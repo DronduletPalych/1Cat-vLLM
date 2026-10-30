@@ -35,9 +35,8 @@ class Qwen35MoeAdapter(Qwen35Adapter):
     architecture_label = "Qwen3.5 MoE"
     layer_names = {**_LAYERS, **_EXPERTS}
 
-    @staticmethod
-    def is_linear(name):
-        return Qwen35Adapter.is_linear(name) and not name.endswith(
+    def is_linear(self, name):
+        return super().is_linear(name) and not name.endswith(
             (".mlp.gate.weight", ".mlp.shared_expert_gate.weight")
         )
 

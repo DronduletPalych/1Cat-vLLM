@@ -45,6 +45,33 @@ _LAYERS = {
     "ffn_down.weight": "mlp.down_proj.weight",
 }
 
+# llama.cpp ``clip`` mmproj layout -> Qwen3_VisionTransformer parameters.
+# The names below are relative to ``model.visual.``; the VL model's
+# WeightsMapper rewrites that prefix to the module's ``visual.`` at load time.
+_VISION_BLOCKS = {
+    "attn_qkv": "attn.qkv",  # fused Q/K/V; QKVParallelLinear shards it
+    "attn_out": "attn.proj",
+    "ffn_up": "mlp.linear_fc1",
+    "ffn_down": "mlp.linear_fc2",
+    "ln1": "norm1",
+    "ln2": "norm2",
+}
+_VISION_GLOBALS = {
+    "mm.0.weight": "merger.linear_fc1.weight",
+    "mm.0.bias": "merger.linear_fc1.bias",
+    "mm.2.weight": "merger.linear_fc2.weight",
+    "mm.2.bias": "merger.linear_fc2.bias",
+    "v.post_ln.weight": "merger.norm.weight",
+    "v.post_ln.bias": "merger.norm.bias",
+    "v.position_embd.weight": "pos_embed.weight",
+    "v.patch_embd.weight": "patch_embed.proj.weight",
+    "v.patch_embd.bias": "patch_embed.proj.bias",
+}
+# llama.cpp splits the patch Conv3d kernel (temporal=2) into two time slices.
+_VISION_PATCH_EMBED = "v.patch_embd.weight"
+_VISION_PATCH_EMBED_TAIL = "v.patch_embd.weight.1"
+_VISION_PREFIX = "model.visual."
+
 
 def _embedding_chunks(tensor, dtype, name, rows_per_chunk=1024):
     rows, columns = map(int, tensor.shape[::-1])
@@ -156,10 +183,14 @@ class Qwen35Adapter:
     layer_names = _LAYERS
     architecture_label = "Qwen3.5"
     packed_embeddings = True
+    # Adapters that reuse this mapping for a text-only checkpoint (for example
+    # the DFlash draft) keep the default: their tensor set has no mmproj side.
+    multimodal = False
 
-    def __init__(self, config, tp_size=1):
+    def __init__(self, config, tp_size=1, multimodal=False):
         self.config = config
         self.tp_size = tp_size
+        self.multimodal = multimodal
         self.fallback_reasons = {}
         repeat, remainder = divmod(
             config.linear_num_value_heads, config.linear_num_key_heads
@@ -172,12 +203,64 @@ class Qwen35Adapter:
             else None
         )
 
+    def _map_vision_name(self, name):
+        """Map a llama.cpp ``clip`` mmproj tensor onto ``model.visual.*``.
+
+        Returns None for names that are not vision tensors. The mmproj stores a
+        fused ``attn_qkv`` (QKVParallelLinear shards it on load), pre-merge
+        ``v.post_ln`` for the merger norm, and a two-layer MLP projector.
+        """
+        if not self.multimodal:
+            return None
+        if (global_name := _VISION_GLOBALS.get(name)) is not None:
+            return _VISION_PREFIX + global_name
+        match = re.fullmatch(
+            r"v\.blk\.(\d+)\.(attn_qkv|attn_out|ffn_up|ffn_down|ln1|ln2)"
+            r"\.(weight|bias)",
+            name,
+        )
+        if match:
+            return (
+                f"{_VISION_PREFIX}blocks.{int(match[1])}."
+                f"{_VISION_BLOCKS[match[2]]}.{match[3]}"
+            )
+        return None
+
+    def _is_vision_name(self, name):
+        """Vision tensors are dense F16/F32 parameters, never GGUF qweights."""
+        return self.multimodal and name.startswith(_VISION_PREFIX)
+
     def build_name_map(self, tensors):
         result = {}
+
+        def _text_name(base):
+            # In multimodal mode the Qwen3_5ForConditionalGeneration mapper
+            # routes `model.language_model.` -> `language_model.model.` and
+            # `model.visual.` -> `visual.`, while the text-only
+            # Qwen3_5ForCausalLM keeps the flat `model.*` layout. Only the
+            # leading `model.` is re-rooted; `lm_head.weight` (no `model.`
+            # prefix) is left untouched for the mapper's `lm_head.` rule.
+            if self.multimodal and base.startswith("model."):
+                return "model.language_model." + base[len("model.") :]
+            return base
+
         for name in tensors:
             if name in self.global_names:
-                result[name] = self.global_names[name]
+                result[name] = _text_name(self.global_names[name])
                 continue
+            vision_name = self._map_vision_name(name)
+            if vision_name is not None:
+                result[name] = vision_name
+                continue
+            if self.multimodal:
+                if name == _VISION_PATCH_EMBED_TAIL:
+                    # Second temporal slice of the patch Conv3d kernel; it is
+                    # stacked onto v.patch_embd.weight when yielding weights.
+                    continue
+                if name.startswith(("v.", "mm.")):
+                    raise ValueError(
+                        f"Unmapped {self.architecture_label} mmproj tensor: {name}"
+                    )
             match = re.fullmatch(r"blk\.(\d+)\.(.+)", name)
             if match:
                 block, suffix = int(match[1]), match[2]
@@ -189,13 +272,16 @@ class Qwen35Adapter:
                     ):
                         continue
                 elif suffix in self.layer_names:
-                    result[name] = f"model.layers.{block}.{self.layer_names[suffix]}"
+                    result[name] = _text_name(
+                        f"model.layers.{block}.{self.layer_names[suffix]}"
+                    )
                     continue
             raise ValueError(f"Unmapped {self.architecture_label} GGUF tensor: {name}")
         return result
 
-    @staticmethod
-    def is_linear(name):
+    def is_linear(self, name):
+        if self._is_vision_name(name):
+            return False
         return name.endswith(".weight") and not name.endswith(
             ("norm.weight", "conv1d.weight", "embed_tokens.weight")
         )
@@ -282,6 +368,17 @@ class Qwen35Adapter:
                     ),
                 )
         for raw, name in name_map.items():
+            if raw == _VISION_PATCH_EMBED and self._is_vision_name(name):
+                # llama.cpp stores the patch Conv3d kernel (temporal=2) as two
+                # time slices; gguf_reader already returns them in torch order
+                # (out, in, kh, kw), so they only need joining on the temporal
+                # axis. No transpose is required.
+                slices = [
+                    torch.from_numpy(tensors[part].data.copy())
+                    for part in (_VISION_PATCH_EMBED, _VISION_PATCH_EMBED_TAIL)
+                ]
+                yield name, torch.stack(slices, dim=2).to(dtype)
+                continue
             tensor = tensors[raw]
             quantized = tensor.tensor_type not in (
                 gguf.GGMLQuantizationType.F32,
@@ -317,7 +414,8 @@ class Qwen35Adapter:
                 weight = torch.from_numpy(data).view(torch.bfloat16)
             else:
                 weight = torch.from_numpy(tensor.data.copy())
-            weight = self.restore(name, weight)
+            if not self._is_vision_name(name):
+                weight = self.restore(name, weight)
             if not quantized or dense_fallback or not self.is_linear(name):
                 # The model keeps A_log in FP32 even under --dtype half.
                 # Preserve inverse-log precision rather than rounding through
