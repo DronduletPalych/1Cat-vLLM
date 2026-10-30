@@ -126,6 +126,11 @@ class DirCapacity:
         self.instances = 0
         self.evictions = 0
         self.state_evictions = 0
+        # State-cap victims split by whether the block had ever been read: the
+        # cap must prefer never-read checkpoints, so a growing *_read counter
+        # means the cap is dropping state a session already restored.
+        self.state_evict_unread = 0
+        self.state_evict_read = 0
         self.rejected = 0
         self.store_failed = 0
         self.load_errors = 0
@@ -411,31 +416,55 @@ class DirCapacity:
         return self._evict_bundle_locked(path) > 0
 
     def _pick_state_victim_locked(self) -> tuple[_BlockKey, str] | None:
-        """The oldest checkpoint, if its whole bundle is idle."""
+        """A checkpoint to drop: never-read first, FIFO as the tie-break.
+
+        FIFO alone dropped the checkpoint that was just restored and kept a
+        stale one that no session ever read again. Preferring checkpoints whose
+        bundle was never read keeps the ones that already proved useful (a
+        chain hit reads them) and only falls back to the oldest read one when
+        every checkpoint has been read.
+
+        An in-flight reader still blocks the eviction instead of falling
+        through to a newer checkpoint: evicting the state a session is reading
+        right now is exactly what the cap must not do.
+        """
         stale: list[_BlockKey] = []
-        victim: tuple[_BlockKey, str] | None = None
+        unread: list[tuple[_BlockKey, str]] = []
+        read: list[tuple[_BlockKey, str]] = []
+        head_busy: dict[bool, bool] = {True: False, False: False}
         for key, path in self._checkpoints.items():
             if path not in self._entries:
                 stale.append(key)
                 continue
-            if any(self._inflight.get(p) for p in self._bundle_paths_locked(path)):
-                # The oldest checkpoint is being read right now. Do not fall
-                # through to a newer one: evicting the checkpoint a session
-                # just wrote is exactly what the cap exists to prevent, so
-                # wait for the reader instead.
-                break
-            victim = (key, path)
-            break
+            bundle = self._bundle_paths_locked(path)
+            busy = any(self._inflight.get(p) for p in bundle)
+            entry_reads = sum(
+                entry.reads for p in bundle if (entry := self._entries.get(p))
+            )
+            never_read = not entry_reads
+            queue = unread if never_read else read
+            if not queue and busy:
+                # The head of this class is being read right now: wait for the
+                # reader instead of evicting a younger checkpoint of the class.
+                head_busy[never_read] = True
+            queue.append((key, path))
         for key in stale:
             self._checkpoints.pop(key, None)
-        return victim
+        for never_read, queue in ((True, unread), (False, read)):
+            if not queue:
+                continue
+            if head_busy[never_read]:
+                return None
+            return queue[0]
+        return None
 
     def _enforce_state_cap_locked(self) -> None:
-        """Drop the oldest Mamba checkpoints until state bytes fit the cap.
+        """Drop Mamba checkpoints until state bytes fit the cap.
 
-        FIFO by commit order, deliberately not LRU: the checkpoint just written
-        by the current turn is the one the next turn of that session needs, and
-        reading it must not make a stale checkpoint look younger.
+        Victims are chosen by ``_pick_state_victim_locked``: never-read
+        checkpoints first (FIFO among them), read ones only when nothing else
+        is left. Restoring a checkpoint must not immediately make it the next
+        victim — that is what made a session lose its own prefix state.
         """
         if not self.state_max_bytes or not self._state_bytes:
             return
@@ -446,16 +475,29 @@ class DirCapacity:
                 # retries once the in-flight reader finishes.
                 return
             key, path = victim
+            victim_reads = sum(
+                entry.reads
+                for p in self._bundle_paths_locked(path)
+                if (entry := self._entries.get(p))
+            )
             removed = self._evict_bundle_locked(path)
             if removed == 0:
                 self._checkpoints.pop(key, None)
                 continue
             self.state_evictions += 1
+            if victim_reads:
+                self.state_evict_read += 1
+            else:
+                self.state_evict_unread += 1
             logger.info(
-                "FS-STATE-EVICT path=%s removed=%d state_bytes=%d state_max=%d "
+                "FS-STATE-EVICT path=%s removed=%d victim_reads=%d "
+                "unread_total=%d read_total=%d state_bytes=%d state_max=%d "
                 "used=%d limit=%d checkpoints=%d",
                 path,
                 removed,
+                victim_reads,
+                self.state_evict_unread,
+                self.state_evict_read,
                 self._state_bytes,
                 self.state_max_bytes,
                 self._used,
@@ -635,6 +677,8 @@ class DirCapacity:
                 "fs_attn_bytes": self._attn_bytes,
                 "fs_state_bytes_limit": self.state_max_bytes,
                 "fs_state_evictions_total": self.state_evictions,
+                "fs_state_evict_unread_total": self.state_evict_unread,
+                "fs_state_evict_read_total": self.state_evict_read,
                 "fs_checkpoints": len(self._checkpoints),
                 "fs_overshoot_bytes": max(0, self._used - self.max_bytes),
                 "fs_evictions_total": self.evictions,
@@ -659,7 +703,8 @@ class DirCapacity:
             "evictions=%d rejected=%d store_failed=%d load_errors=%d "
             "drift=%d state_bytes=%d attn_bytes=%d state_limit=%d "
             "state_evict=%d checkpoints=%d files=%d stored_blocks=%d "
-            "loaded_blocks=%d lookups=%d lookup_hits=%d inflight=%d instances=%d",
+            "loaded_blocks=%d lookups=%d lookup_hits=%d inflight=%d instances=%d "
+            "state_evict_unread=%d state_evict_read=%d",
             snap["fs_bytes_used"],
             snap["fs_bytes_limit"],
             snap["fs_overshoot_bytes"],
@@ -681,45 +726,61 @@ class DirCapacity:
             snap["fs_lookup_hits"],
             snap["fs_inflight"],
             snap["fs_instances"],
+            snap["fs_state_evict_unread_total"],
+            snap["fs_state_evict_read_total"],
         )
 
     def drift_check(self) -> int:
-        """Compare the committed counter with the real on-disk sum."""
-        on_disk = 0
-        files = 0
-        for dirpath, _dirnames, filenames in os.walk(self.real_root):
-            for name in filenames:
-                if name.endswith(".tmp") or name == LOCK_NAME:
-                    continue
-                try:
-                    st = os.stat(os.path.join(dirpath, name))
-                except OSError:
-                    continue
-                on_disk += self._entry_size(st.st_size)
-                files += 1
+        """Compare the committed counter with the real on-disk sum.
+
+        The tree walk runs under ``self._lock``: measuring outside it made every
+        concurrent commit look like drift (a completed store bumped
+        ``_committed`` after the walk had already missed its file), so the
+        metric carried a whole block file of noise. The walk is a few thousand
+        stat calls at the cap, once per ``_DRIFT_INTERVAL_S``, and the lock is
+        held for that window only — cheaper than an approximate number that
+        cannot be trusted to detect a real leak.
+        """
+        started = time.monotonic()
         with self._lock:
+            on_disk = 0
+            files = 0
+            for dirpath, _dirnames, filenames in os.walk(self.real_root):
+                for name in filenames:
+                    if name.endswith(".tmp") or name == LOCK_NAME:
+                        continue
+                    try:
+                        st = os.stat(os.path.join(dirpath, name))
+                    except OSError:
+                        continue
+                    on_disk += self._entry_size(st.st_size)
+                    files += 1
             drift = on_disk - self._committed
             self.drift_bytes = drift
             self.files = files
+            committed = self._committed
+        scan_ms = int((time.monotonic() - started) * 1000)
         limit = self.max_bytes
         if abs(drift) > limit // 100:
             logger.error(
                 "FS-DRIFT accounting mismatch: on_disk=%d committed=%d drift=%d "
-                "(limit=%d, tolerance=%d) root_dir=%s",
+                "(limit=%d, tolerance=%d, scan_ms=%d) root_dir=%s",
                 on_disk,
-                self._committed,
+                committed,
                 drift,
                 limit,
                 limit // 100,
+                scan_ms,
                 self.real_root,
             )
         else:
             logger.info(
-                "FS-DRIFT ok on_disk=%d committed=%d drift=%d files=%d",
+                "FS-DRIFT ok on_disk=%d committed=%d drift=%d files=%d scan_ms=%d",
                 on_disk,
-                self._committed,
+                committed,
                 drift,
                 files,
+                scan_ms,
             )
         return drift
 
