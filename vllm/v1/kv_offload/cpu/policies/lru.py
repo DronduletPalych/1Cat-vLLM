@@ -37,6 +37,9 @@ class LRUCachePolicy(CachePolicy):
     def clear(self) -> None:
         self.blocks.clear()
 
+    def iter_blocks(self) -> Iterable[tuple[OffloadKey, BlockStatus]]:
+        return iter(self.blocks.items())
+
     def evict(
         self, n: int, protected: set[OffloadKey]
     ) -> list[tuple[OffloadKey, BlockStatus]] | None:

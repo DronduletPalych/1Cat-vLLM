@@ -101,6 +101,10 @@ class ARCCachePolicy(CachePolicy):
         self.b2.clear()
         self.target_t1_size = 0.0
 
+    def iter_blocks(self) -> Iterable[tuple[OffloadKey, BlockStatus]]:
+        yield from self.t1.items()
+        yield from self.t2.items()
+
     def evict(
         self, n: int, protected: set[OffloadKey]
     ) -> list[tuple[OffloadKey, BlockStatus]] | None:

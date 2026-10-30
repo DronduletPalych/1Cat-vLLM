@@ -1065,6 +1065,10 @@ class OffloadingConnectorScheduler:
             self._touch(req_status)
 
             keys_to_store = set(store_output.keys_to_store)
+            # Keys the tier refused stay below the store cursor so the next step
+            # offers them again instead of skipping them for good. A key that is
+            # merely already cached is not deferred and does not block the cursor.
+            deferred_keys = set(store_output.deferred_keys)
 
             group_sizes: list[int] = [0] * self.config.num_kv_cache_groups
             block_indices: list[int] = [0] * self.config.num_kv_cache_groups
@@ -1084,14 +1088,21 @@ class OffloadingConnectorScheduler:
                 num_group_blocks = 0
                 start_gpu_block_idx: int | None = None
                 dbg_keys: list[OffloadKey] = []
+                next_stored_idx = start_block_idx
                 for idx, offload_key in enumerate(
                     group_state.offload_keys[start_block_idx:num_blocks]
                 ):
+                    offloaded_block_idx = start_block_idx + idx
                     if offload_key not in keys_to_store:
+                        if offload_key in deferred_keys:
+                            # The tier refused this block. Stop here: the cursor
+                            # must not move past it, or the block is never
+                            # retried and can never reach a secondary tier.
+                            break
+                        next_stored_idx = offloaded_block_idx + 1
                         continue
                     dbg_keys.append(offload_key)
 
-                    offloaded_block_idx = start_block_idx + idx
                     gpu_block_idx = offloaded_block_idx * block_size_factor
                     for i in range(block_size_factor):
                         block_id = block_ids[gpu_block_idx + i]
@@ -1107,10 +1118,11 @@ class OffloadingConnectorScheduler:
                             sliding_window_block_ids.append(block_id)
                         else:
                             non_sliding_window_block_ids.append(block_id)
+                    next_stored_idx = offloaded_block_idx + 1
 
                 group_sizes[group_config.group_idx] = num_group_blocks
                 block_indices[group_config.group_idx] = start_gpu_block_idx or 0
-                group_state.next_stored_block_idx = num_blocks
+                group_state.next_stored_block_idx = next_stored_idx
                 if _DBG_LOOKUP:
                     dbg_groups.setdefault(group_config.group_idx, {}).update(
                         stored=num_group_blocks,
@@ -1431,6 +1443,12 @@ class OffloadingConnectorScheduler:
                     # Every key is already in the tier (an identical prefix was
                     # stored before). Nothing to transfer and nothing to retry.
                     continue
+                if len(keys_to_store) < len(keys):
+                    # The host tier admitted only part of the boundary bundle.
+                    # Keep the offer pending so a later step can finish the
+                    # groups that were refused; storing the attention half
+                    # without its state (or the reverse) never yields a hit.
+                    still_pending.extend(entries)
 
                 ordered_keys = [k for k in keys if k in keys_to_store]
                 group_sizes = [0] * num_groups
