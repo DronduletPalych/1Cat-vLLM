@@ -445,6 +445,10 @@ class TieringOffloadingManager(OffloadingManager):
         """Demote in the CPU tier; secondary tiers keep their own policy."""
         self.primary_tier.demote(keys, req_context)
 
+    def pool_stats(self) -> tuple[int, int, int, int, int]:
+        """Slot accounting of the primary pool, delegated to the tier that owns it."""
+        return self.primary_tier.pool_stats()
+
     def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
         """
         Mark blocks as done loading from primary tier to GPU.
