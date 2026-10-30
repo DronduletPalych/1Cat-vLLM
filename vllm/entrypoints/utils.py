@@ -172,6 +172,13 @@ def cli_env_setup():
         os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 
+# A request that omits `max_tokens` would otherwise be treated as asking for
+# `max_model_len - input_length`, i.e. the whole remaining context window. That
+# makes every such request reserve (almost) the entire KV pool and serializes
+# admission. Bound the implicit request to a realistic output length instead.
+DEFAULT_MAX_OUTPUT_TOKENS = 32768
+
+
 def get_max_tokens(
     max_model_len: int,
     max_tokens: int | None,
@@ -198,6 +205,8 @@ def get_max_tokens(
         if max_tokens is not None
         else default_sampling_params.get("max_tokens")
     )
+    if fallback_max_tokens is None:
+        fallback_max_tokens = DEFAULT_MAX_OUTPUT_TOKENS
 
     return min(
         val

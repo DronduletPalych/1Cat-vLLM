@@ -1260,6 +1260,10 @@ class MambaManager(SingleTypeKVCacheManager):
             # Usually one entry; under async scheduling a second one can be
             # pending because the previous step has not been processed yet.
             self.last_state_block_idx: dict[str, list[int]] = {}
+            # Requests whose prompt-boundary state has already been offered to
+            # the host tier. A request can resume only from the boundary its
+            # prompt ends on, so one offer per request is all that is useful.
+            self._prompt_state_done: set[str] = set()
             # The set of the requests that have been allocated blocks
             self._allocated_block_reqs: set[str] = set()
 
@@ -1517,6 +1521,7 @@ class MambaManager(SingleTypeKVCacheManager):
         if self.mamba_cache_mode == "align":
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
+            self._prompt_state_done.discard(request_id)
             # A hand-off is valid only while its source still belongs to this
             # request. Drop offers that have not reached the connector before
             # returning the request's blocks to the pool.
@@ -1605,10 +1610,36 @@ class MambaManager(SingleTypeKVCacheManager):
         blocks = self.req_to_blocks[request.request_id]
         for block_idx in range(num_cached_blocks_before, num_full_blocks):
             block = blocks[block_idx]
-            if block.is_null or block.block_hash is None:
+            if block.is_null:
                 continue
-            self.cached_blocks_this_step.add(block.block_hash)
+            # A block whose mask kept it out of the hash map has no hash, but
+            # its boundary state is still addressable: the offload key comes
+            # from the request's block hashes, not from the GPU block.
+            if block.block_hash is not None:
+                self.cached_blocks_this_step.add(block.block_hash)
+            # Hand off a boundary state only for a block the prefix cache keeps.
+            # ``cache_full_blocks`` drops blocks the retention mask skips: they
+            # get no hash and can never serve a hit, so their states can never
+            # be looked up either.
+            if mask is not None and not mask[block_idx - num_cached_blocks_before]:
+                continue
             if self.mamba_cache_mode == "align":
+                # A state slot is worth one boundary: the one a later request
+                # resumes from, which is where this request's prompt ends.
+                # ``num_tokens`` arrives aligned down, so the first call that
+                # reaches the aligned prompt end is the one that carries it.
+                # Storing every intermediate step fills the small state pool
+                # with positions nothing can resume from and evicts the states
+                # of prefixes that are still cached, which turns the repeat of
+                # a cached prompt into a full recompute.
+                align = alignment_tokens or self.block_size
+                prompt_aligned = request.num_prompt_tokens // align * align
+                if (
+                    num_tokens < prompt_aligned
+                    or request.request_id in self._prompt_state_done
+                ):
+                    continue
+                self._prompt_state_done.add(request.request_id)
                 self._pending_boundary_state_offloads.append(
                     (
                         request.request_id,

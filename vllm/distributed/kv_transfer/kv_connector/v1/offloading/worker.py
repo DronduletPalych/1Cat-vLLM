@@ -48,6 +48,10 @@ class OffloadingConnectorWorker:
         # job_id -> req_id for in-flight loads.
         self._load_jobs: dict[int, ReqId] = {}
         self._unsubmitted_store_jobs: list[tuple[int, TransferSpec]] = []
+        # Load jobs already submitted for the metadata bound to this step.
+        # load_host_tier_state_early() submits them before the model reads
+        # Mamba state; start_load_kv() must then not copy them twice.
+        self._loads_submitted: object | None = None
         self._connector_worker_meta = OffloadingWorkerMetadata()
 
     def _register_handlers(self, kv_caches: CanonicalKVCaches):
@@ -253,16 +257,27 @@ class OffloadingConnectorWorker:
         if kv_connector_metadata.jobs_to_flush:
             self.worker.wait(kv_connector_metadata.jobs_to_flush)
 
-    def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
-        for job_id, transfer_spec in self._unsubmitted_store_jobs:
-            success = self.worker.transfer_async(job_id, transfer_spec)
-            assert success
-        self._unsubmitted_store_jobs.clear()
+    def start_kv_transfers(
+        self, metadata: OffloadingConnectorMetadata, loads_only: bool = False
+    ):
+        if not loads_only:
+            for job_id, transfer_spec in self._unsubmitted_store_jobs:
+                success = self.worker.transfer_async(job_id, transfer_spec)
+                assert success
+            self._unsubmitted_store_jobs.clear()
 
-        for job_id, entry in metadata.load_jobs.items():
-            self._load_jobs[job_id] = entry.req_id
-            success = self.worker.transfer_async(job_id, entry.transfer_spec)
-            assert success
+        if metadata.load_jobs and metadata.load_jobs is not self._loads_submitted:
+            self._loads_submitted = metadata.load_jobs
+            for job_id, entry in metadata.load_jobs.items():
+                # Loads are synchronous now: the scheduler does not park the
+                # request in WAITING_FOR_REMOTE_KVS, so it must not receive a
+                # finished_recving signal either (the core asserts that the
+                # request is finished when it gets one outside that state).
+                success = self.worker.transfer_async(job_id, entry.transfer_spec)
+                assert success
+            # The scheduler now issues host-tier loads synchronously, so the
+            # data must be resident before the forward pass reads it.
+            self.worker.wait(set(metadata.load_jobs))
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for job_id, entry in metadata.store_jobs.items():

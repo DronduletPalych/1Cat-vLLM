@@ -85,6 +85,15 @@ class PrepareStoreOutput:
     keys_to_store: list[OffloadKey]
     store_spec: LoadStoreSpec
     evicted_keys: list[OffloadKey]
+    # Keys the manager was offered but could not admit this step. The caller must
+    # not treat them as stored-and-done: it retries them on a later step. Empty
+    # means every offered key was either stored now or already held.
+    deferred_keys: tuple[OffloadKey, ...] = ()
+    # Keys evicted from this tier whose data is being copied to a slower tier
+    # before their slot is released. They are already gone from this tier (a
+    # lookup misses), but their slot is not reusable yet: freeing it here would
+    # overwrite the bytes the copy is reading.
+    cascaded_keys: tuple[OffloadKey, ...] = ()
 
 
 @dataclass
@@ -139,6 +148,14 @@ class OffloadingManager(ABC):
             scheduler.
         """
         pass
+
+    def contains(self, key: OffloadKey) -> bool:
+        """Read-only membership probe, used by diagnostics only.
+
+        Backends without a queryable index return False; the value is never
+        consulted outside debug logging.
+        """
+        return False
 
     @abstractmethod
     def prepare_load(

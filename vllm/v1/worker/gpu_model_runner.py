@@ -4867,12 +4867,15 @@ class GPUModelRunner(
             self.spec_state_slot_selectors.gpu.fill_(1)
 
         if self.mamba_prev_last_scheduled_idx is not None:
+            _, _mamba_spec = mamba_utils.get_mamba_groups(self.kv_cache_config)
             mamba_utils.preprocess_mamba_all_specdec(
                 scheduler_output,
                 self.input_batch,
                 self.mamba_state_idx,
                 num_reqs,
                 self.mamba_prev_last_scheduled_idx,
+                self.requests,
+                _mamba_spec.block_size,
             )
         if profile_inputs:
             profile_state_sync_ms = (time.perf_counter() - profile_stage_t0) * 1000.0
@@ -8371,6 +8374,24 @@ class GPUModelRunner(
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+
+            # A host-tier restore writes blocks the model reads before the
+            # forward pass: the Mamba boundary state that preprocess_mamba
+            # copies out of, and the state spec-decode compaction touches.
+            # The connector normally binds and loads inside
+            # maybe_get_kv_connector_output(), which runs later, so bind and
+            # load here first. start_load_kv() is idempotent per metadata.
+            # Not gated on the mamba cache mode: the runner that first reaches
+            # a step is not always the one holding the model's own mode.
+            if (
+                scheduler_output.kv_connector_metadata is not None
+                and has_kv_transfer_group()
+            ):
+                kv_connector_early = get_kv_transfer_group()
+                kv_connector_early.bind_connector_metadata(
+                    scheduler_output.kv_connector_metadata
+                )
+                kv_connector_early.load_host_tier_state_early()
 
             trace_prepare_inputs_t0 = time.perf_counter() if trace_log else 0.0
             logits_indices, spec_decode_metadata = self._prepare_inputs(

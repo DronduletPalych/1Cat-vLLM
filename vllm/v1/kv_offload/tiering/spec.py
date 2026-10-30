@@ -17,6 +17,13 @@ Configuration via kv_connector_extra_config:
       - Additional tier-specific parameters are passed directly to the tier
         constructor. See each tier's documentation for supported parameters.
 
+    The "fs" tier accepts, besides root_dir:
+      - max_bytes: (required) hard capacity of the whole directory
+      - max_overshoot_bytes: how far one job may push usage above max_bytes
+      - state_max_bytes: hard cap on Mamba checkpoint (recurrent state) bytes,
+        default 4 GiB, 0 disables it. Checkpoints past the cap are dropped
+        oldest-first together with the attention of the same block.
+
 Example configuration:
 {
     "cpu_bytes_to_use": 10737418240,  # 10 GB
@@ -152,6 +159,14 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     cache_policy=self.eviction_policy,  # type: ignore[arg-type]
                     enable_events=enable_events,
                     mmap_region=region,
+                    # Grouped pools address disjoint per-group slots, so a batch
+                    # bigger than the pool may be admitted in part instead of
+                    # being refused whole: the head is stored now, the tail is
+                    # deferred and retried. Without it a request whose batch
+                    # exceeds the (small) per-group slot count could never
+                    # offload anything.
+                    partial_admit=True,
+                    group_label=str(group),
                 )
                 cleanup.callback(primary.shutdown)
                 tiers = []
@@ -166,7 +181,9 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     secondary_tiers=tiers,
                     enable_events=enable_events,
                 )
-            manager = GroupedCPUOffloadingManager(managers)
+            manager = GroupedCPUOffloadingManager(
+                managers, mamba_groups=getattr(self, "mamba_groups", None)
+            )
             cleanup.pop_all()
             return manager
 

@@ -103,10 +103,15 @@ def key(group, index):
     return make_offload_key(index.to_bytes(8, "big"), group)
 
 
-def manager(capacity=2, policy="lru"):
+def manager(capacity=2, policy="lru", partial=False):
     return GroupedCPUOffloadingManager(
         {
-            g: CPUOffloadingManager(capacity, cache_policy=policy, enable_events=True)
+            g: CPUOffloadingManager(
+                capacity,
+                cache_policy=policy,
+                enable_events=True,
+                partial_admit=partial,
+            )
             for g in GROUPS
         }
     )
@@ -143,12 +148,15 @@ def test_group_pool_lifecycle_and_order(policy):
     out = m.prepare_store(keys, CTX)
     assert out.keys_to_store == keys
     assert list(out.store_spec.block_ids) == [0, 0, 1]
-    assert m.lookup(keys[0], CTX) is None
+    assert m.lookup(keys[0], CTX) is False
     m.complete_store(keys, CTX)
     assert list(m.prepare_load(keys, CTX).block_ids) == [0, 0, 1]
-    # A blocked group defers the entire operation, releasing other reservations.
-    partial = m.prepare_store([key(5, 4), key(0, 4)], CTX)
-    assert partial is None
+    # A blocked group no longer cancels the key the other group can take: the
+    # admitted key is stored and the refused one is reported as deferred.
+    out = m.prepare_store([key(5, 4), key(0, 4)], CTX)
+    assert out is not None
+    assert out.keys_to_store == [key(0, 4)]
+    assert out.deferred_keys == (key(5, 4),)
     assert m.lookup(key(0, 4), CTX) is False
     m.complete_load(keys, CTX)
     m.touch([keys[0]], CTX)
@@ -270,7 +278,18 @@ def _flash_next_spec(
 @pytest.mark.parametrize("layout", ["equal", "scheduler", "mixed", "attention_only"])
 def test_actual_flash_next_group_budget(monkeypatch, layout):
     spec = _flash_next_spec(monkeypatch, layout)
-    if layout not in ("equal", "scheduler"):
+    if layout == "mixed":
+        # Mixed Mamba geometry is a reason to partition, not a reason to share a
+        # page: a shared page has no per-group byte offset, so every group would
+        # write its state at the start of the same page (CPUOffloadingSpec).
+        assert spec.partition_by_group
+        assert spec.num_blocks == 141
+        assert spec.cpu_group_num_blocks == dict.fromkeys(FLASH_NEXT_PAGES, 141)
+        # Per-group pages are a partition of the worker page, not an addition.
+        assert sum(spec.cpu_group_page_sizes.values()) == spec.cpu_page_size_per_worker
+        assert _grouped_bytes(spec) <= 16 * 1024**3
+        return
+    if layout != "equal" and layout != "scheduler":
         assert not spec.partition_by_group
         assert spec.num_blocks == 419
         assert spec.cpu_group_num_blocks == {}
@@ -528,7 +547,13 @@ def test_grouped_worker_initialization_failure_releases_regions(monkeypatch, fai
 
 @pytest.mark.parametrize("policy", ["lru", "arc"])
 @pytest.mark.parametrize("blocked_first", [True, False])
-def test_deferred_group_releases_reservations_and_retries(policy, blocked_first):
+def test_starved_group_does_not_cancel_other_groups(policy, blocked_first):
+    """A group whose pool is pinned must not drop the blocks that fit.
+
+    A block that never gets a host slot never reaches a secondary tier, so a
+    refusal in one pool must not cancel the whole batch: the other groups store
+    what they can and the starved group's keys stay out for a later retry.
+    """
     m = manager(capacity=1, policy=policy)
     pinned = key(5, 1)
     store(m, [pinned])
@@ -536,14 +561,76 @@ def test_deferred_group_releases_reservations_and_retries(policy, blocked_first)
     keys = [key(5, 2), key(0, 2)]
     if not blocked_first:
         keys.reverse()
+    out = m.prepare_store(keys, CTX)
+    assert out is not None
+    assert out.keys_to_store == [key(0, 2)]
+    assert out.evicted_keys == []
+    assert m.lookup(key(0, 2), CTX) is False  # accepted, write in flight
+    assert m.lookup(pinned, CTX) is True
+    m.complete_store(out.keys_to_store, CTX)
+    assert m.lookup(key(0, 2), CTX) is True
+    # the starved group still misses its key and takes it once the load ends
+    assert m.lookup(key(5, 2), CTX) is False
+    m.complete_load([pinned], CTX)
+    out = store(m, [key(5, 2)])
+    assert out.keys_to_store == [key(5, 2)]
+
+
+@pytest.mark.parametrize("policy", ["lru", "arc"])
+def test_store_refused_only_when_no_group_can_accept(policy):
+    """Every starved pool refuses the batch, and nothing is left half-stored."""
+    m = manager(capacity=1, policy=policy)
+    pinned = key(0, 1)
+    store(m, [pinned])
+    m.prepare_load([pinned], CTX)
     for _ in range(3):
-        assert m.prepare_store(keys, CTX) is None
-        assert all(m.lookup(k, CTX) is False for k in keys)
+        assert m.prepare_store([key(0, 2)], CTX) is None
+        assert m.lookup(key(0, 2), CTX) is False
         assert m.lookup(pinned, CTX) is True
     m.complete_load([pinned], CTX)
-    out = store(m, keys)
-    assert out.keys_to_store == keys
-    assert all(m.lookup(k, CTX) is True for k in keys)
+    out = store(m, [key(0, 2)])
+    assert out.keys_to_store == [key(0, 2)]
+
+
+@pytest.mark.parametrize("policy", ["lru", "arc"])
+def test_partial_admit_keeps_the_tail_for_a_later_step(policy):
+    """A pool that cannot take the whole batch stores its leading part.
+
+    The refused tail is still absent, so the caller's next step offers it again
+    instead of the batch being dropped whole.
+    """
+    m = manager(capacity=2, policy=policy, partial=True)
+    ready = [key(0, i) for i in range(2)]
+    store(m, ready)
+    fresh = [key(0, i) for i in range(2, 5)]
+    out = m.prepare_store(fresh, CTX)
+    assert out is not None
+    assert out.keys_to_store == fresh[:2]
+    assert set(out.evicted_keys) == set(ready)
+    m.complete_store(out.keys_to_store, CTX)
+    assert all(m.lookup(k, CTX) is True for k in fresh[:2])
+    assert m.lookup(fresh[2], CTX) is False
+    # the tail is admitted once slots have been freed by the next round
+    out = m.prepare_store(fresh[2:], CTX)
+    assert out is not None
+    assert out.keys_to_store == fresh[2:4]
+
+
+@pytest.mark.parametrize("policy", ["lru", "arc"])
+def test_partial_admit_never_evicts_an_inflight_slot(policy):
+    """A slot whose write is in flight is not a candidate, even when short."""
+    m = manager(capacity=2, policy=policy, partial=True)
+    ready = key(0, 0)
+    store(m, [ready])
+    inflight = key(0, 1)
+    assert m.prepare_store([inflight], CTX) is not None
+    out = m.prepare_store([key(0, 2), key(0, 3)], CTX)
+    assert out is not None
+    assert out.keys_to_store == [key(0, 2)]
+    assert out.evicted_keys == [ready]
+    assert m.lookup(inflight, CTX) is False
+    m.complete_store([inflight], CTX)
+    assert m.lookup(inflight, CTX) is True
 
 
 @pytest.mark.parametrize("policy", ["lru", "arc"])
@@ -554,11 +641,16 @@ def test_deferred_store_preserves_existing_and_inflight_keys(policy):
     store(m, [ready, *pinned])
     m.prepare_store([inflight], CTX)
     m.prepare_load(pinned, CTX)
-    assert m.prepare_store([ready, inflight, fresh, key(5, 3)], CTX) is None
+    # The pinned group refuses its key, the group with room stores its own, and
+    # the already-cached and in-flight keys are left exactly as they were.
+    out = m.prepare_store([ready, inflight, fresh, key(5, 3)], CTX)
+    assert out is not None
+    assert out.keys_to_store == [fresh]
+    assert out.deferred_keys == (key(5, 3),)
     assert m.lookup(ready, CTX) is True
-    assert m.lookup(inflight, CTX) is None
+    assert m.lookup(inflight, CTX) is False
     assert m.lookup(fresh, CTX) is False
     m.complete_store([inflight], CTX)
     assert m.lookup(inflight, CTX) is True
     m.complete_load(pinned, CTX)
-    assert store(m, [fresh, key(5, 3)]).keys_to_store == [fresh, key(5, 3)]
+    assert store(m, [fresh, key(5, 3)]).keys_to_store == [key(5, 3)]

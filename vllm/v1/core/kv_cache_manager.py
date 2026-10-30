@@ -127,12 +127,26 @@ class KVCacheManager:
         metrics_collector: KVCacheMetricsCollector | None = None,
         prefix_cache_retention_interval: int | None = None,
         watermark: float = 0.0,
+        kv_cache_tokens: int | None = None,
+        watermark_output_reserve: int = 0,
     ) -> None:
         self.max_model_len = max_model_len
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests. 0.0 disables it.
         assert watermark >= 0.0, "watermark must be non-negative"
         self.watermark_blocks = int(watermark * kv_cache_config.num_blocks)
+        # Full reservations (prompt + max output, in tokens) of admitted
+        # requests. A chunked prefill has not allocated its whole sequence
+        # yet, so a later admission must not spend what the earlier one was
+        # already promised.
+        self._reserved_tokens: dict[str, int] = {}
+        self.kv_cache_tokens = kv_cache_tokens or 0
+        self.watermark_tokens = int(watermark * self.kv_cache_tokens)
+        # Cap the per-request output reservation. A request without an
+        # explicit `max_tokens` asks for `max_model_len - prompt_len`, so the
+        # uncapped reservation would hold almost the whole pool for one
+        # request and serialize admissions. 0 disables the cap.
+        self.watermark_output_reserve = watermark_output_reserve
         # When unset, fall back to `max_model_len` so the recycling-aware cap
         # collapses to the prior (uncapped) admission behavior. The scheduler
         # always supplies the real value at runtime.
@@ -250,6 +264,18 @@ class KVCacheManager:
             )
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
+
+    def _reserved_output_tokens(self, request: Request) -> int:
+        """Output tokens the admission watermark reserves for ``request``.
+
+        Capped by ``watermark_output_reserve`` so one request without an
+        explicit ``max_tokens`` (which the API resolves to
+        ``max_model_len - prompt_len``) cannot reserve the whole pool.
+        """
+        requested = getattr(request, "max_tokens", 0) or 0
+        if self.watermark_output_reserve > 0:
+            return min(requested, self.watermark_output_reserve)
+        return requested
 
     def allocate_slots(
         self,
@@ -386,11 +412,17 @@ class KVCacheManager:
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
             )
-            if (
-                num_blocks_to_allocate + watermark_blocks
-                > self.block_pool.get_num_free_blocks()
-            ):
+            # Watermark: reserve prompt + max output of every admitted request
+            # and keep (1 - watermark) of the token budget as the ceiling. It
+            # must hold regardless of how large the incoming request is.
+            new_reserved = request.num_tokens + self._reserved_output_tokens(request)
+            used = sum(
+                v for rid, v in self._reserved_tokens.items() if rid != request.request_id
+            )
+            budget = self.kv_cache_tokens - self.watermark_tokens
+            if self.kv_cache_tokens and used + new_reserved > budget:
                 return None
+            self._reserved_tokens[request.request_id] = new_reserved
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
         num_tokens_need_slot = min(
@@ -422,7 +454,18 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
         )
 
-        if (
+        if self.kv_cache_tokens and request.status in (
+            RequestStatus.WAITING,
+            RequestStatus.PREEMPTED,
+        ):
+            # Token-budget watermark, the same rule as the full-sequence gate.
+            new_tokens = request.num_tokens + self._reserved_output_tokens(request)
+            used = sum(
+                v for rid, v in self._reserved_tokens.items() if rid != request.request_id
+            )
+            if used + new_tokens > self.kv_cache_tokens - self.watermark_tokens:
+                return None
+        elif (
             num_blocks_to_allocate + watermark_blocks
             > self.block_pool.get_num_free_blocks()
         ):
@@ -476,6 +519,7 @@ class KVCacheManager:
             request: The request to free the blocks.
         """
         self.coordinator.free(request.request_id)
+        self._reserved_tokens.pop(request.request_id, None)
 
     def remove_skipped_blocks(
         self,

@@ -1497,6 +1497,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
             self.block_tables.apply_staged_writes()
+            # Finish offload stores whose source blocks this step reuses before
+            # zeroing them below; see ActiveKVConnector.handle_preemptions.
+            self.kv_connector.handle_preemptions(scheduler_output)
             if scheduler_output.new_block_ids_to_zero:
                 self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
             if scheduler_output.total_num_scheduled_tokens == 0:
@@ -1536,6 +1539,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         early_model_inputs: dict[str, Any] | None = None
         ple_prepared = False
         if not dummy_run:
+            # Host-tier restores have to be resident before the hybrid Mamba
+            # preprocess copies the recurrent state that they carry.
+            self.kv_connector.load_early(scheduler_output)
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)

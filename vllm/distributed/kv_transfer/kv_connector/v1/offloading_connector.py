@@ -6,6 +6,7 @@ from typing import Any
 import torch
 
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
@@ -43,6 +44,8 @@ from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
+
+logger = init_logger(__name__)
 
 class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransfers):
     """Native CPU KV offload connector.
@@ -99,6 +102,28 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransf
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, OffloadingConnectorMetadata)
         self.connector_worker.start_kv_transfers(self._connector_metadata)
+
+    def load_host_tier_state_early(self) -> None:
+        """Make host-tier loads resident before the model reads them.
+
+        The worker copies Mamba recurrent state out of its boundary block
+        before ``start_load_kv()`` runs. A restore that writes that block has
+        to happen first, otherwise the copy carries an uninitialised state
+        into the working block and the request decodes from garbage.
+        """
+        if self.connector_worker is None:
+            return
+        if not isinstance(self._connector_metadata, OffloadingConnectorMetadata):
+            return
+        if not self._connector_metadata.load_jobs:
+            return
+        logger.warning(
+            "OFFLOAD-EARLY-LOAD %d load job(s) submitted before the forward",
+            len(self._connector_metadata.load_jobs),
+        )
+        self.connector_worker.start_kv_transfers(
+            self._connector_metadata, loads_only=True
+        )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass

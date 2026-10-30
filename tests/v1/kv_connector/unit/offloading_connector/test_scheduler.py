@@ -1803,6 +1803,12 @@ def test_cacheable_misalignment_still_rejected(monkeypatch):
 
 @pytest.mark.parametrize("blocked_group", [0, 2])
 def test_grouped_deferred_store_preserves_scheduler_retry(blocked_group):
+    """A starved group cannot cancel the other group, and cannot be skipped.
+
+    The group that still has a slot stores its block in this step; the pinned
+    group's store cursor stays where it is, so the next step retries exactly the
+    block that was refused instead of moving past it.
+    """
     from vllm.v1.kv_offload.base import make_offload_key
     from vllm.v1.kv_offload.cpu.manager import (
         CPUOffloadingManager,
@@ -1822,13 +1828,21 @@ def test_grouped_deferred_store_preserves_scheduler_retry(blocked_group):
         scheduled_new_reqs=[SimpleNamespace(req_id=req.request_id, block_ids=None)],
         num_scheduled_tokens={req.request_id: 16},
     )
-    assert scheduler._build_store_jobs(output) == {}
-    assert all(s.next_stored_block_idx == 0 for s in state.group_states)
+    unblocked = 2 if blocked_group == 0 else 0
+    unblocked_gpu_id = 11 if unblocked == 0 else 21
+    [job] = scheduler._build_store_jobs(output).values()
+    src, _ = job.transfer_spec
+    assert src.block_ids.tolist() == [unblocked_gpu_id]
+    assert src.group_sizes == [int(unblocked == 0), 0, int(unblocked == 2)]
+    assert state.group_states[unblocked].next_stored_block_idx == 1
+    assert state.group_states[blocked_group].next_stored_block_idx == 0
+
     manager.complete_load([pinned], ctx)
     [job] = scheduler._build_store_jobs(output).values()
     src, _ = job.transfer_spec
-    assert src.block_ids.tolist() == [11, 21]
-    assert src.group_sizes == [1, 0, 1]
+    blocked_gpu_id = 11 if blocked_group == 0 else 21
+    assert src.block_ids.tolist() == [blocked_gpu_id]
+    assert src.group_sizes == [int(blocked_group == 0), 0, int(blocked_group == 2)]
     assert [state.group_states[g].next_stored_block_idx for g in (0, 2)] == [1, 1]
 
 

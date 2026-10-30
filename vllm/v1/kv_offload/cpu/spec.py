@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterator
 
 from vllm.config import VllmConfig
@@ -85,13 +86,36 @@ class CPUOffloadingSpec(OffloadingSpec):
                 spec = next(iter(spec.kv_cache_specs.values()))
             if isinstance(spec, MambaSpec):
                 mamba_specs[i] = spec
-        # Equal-sized Mamba/attention blocks need matching checkpoint coverage.
-        # Keep the existing layout for single groups and mixed block geometry.
+        # Per-group pools are what keep CPU pages private to a KV group. A
+        # hybrid model mixes mamba block geometry with attention blocks
+        # (512 vs 1024 here); the shared-page layout then has no per-group
+        # byte offset inside a page, so every group writes its state at the
+        # start of the same page and the last writer wins. Mixed geometry is
+        # therefore a reason to partition, never a reason to share.
+        _grouped_env = os.environ.get("VLLM_CPU_OFFLOAD_GROUPED", "1") != "0"
+        _block_sizes = {self.gpu_block_size[i] for i in cacheable_groups}
         self.partition_by_group = (
             kv_cache_config.num_blocks > 0
             and len(cacheable_groups) > 1
             and bool(mamba_specs)
-            and len({self.gpu_block_size[i] for i in cacheable_groups}) == 1
+            # Escape hatch: one shared page per token block is the layout that
+            # predates per-group pools, and the only one validated end to end
+            # for restore correctness.
+            and _grouped_env
+        )
+        logger.info(
+            "OFFLOAD-LAYOUT partition_by_group=%s num_blocks=%d groups=%d "
+            "mamba_groups=%s block_sizes=%s env=%s spec_types=%s",
+            self.partition_by_group,
+            kv_cache_config.num_blocks,
+            len(cacheable_groups),
+            sorted(mamba_specs),
+            sorted(_block_sizes),
+            _grouped_env,
+            [
+                type(g.kv_cache_spec).__name__
+                for g in kv_cache_config.kv_cache_groups
+            ],
         )
         # Mamba state slots follow the prefix-cache retention policy (see
         # CacheConfig.prefix_cache_retention_interval): sparse retention keeps
@@ -113,9 +137,13 @@ class CPUOffloadingSpec(OffloadingSpec):
 
         self.cpu_group_page_sizes: dict[int, int] = {}
         self.cpu_group_num_blocks: dict[int, int] = {}
+        # Group indices backed by a MambaSpec (state, not attention KV).
+        # Exposed so the grouped offload manager can tell a restorable block
+        # (attention + state) from a half-block that can never be a hit.
+        self.mamba_groups: set[int] = set()
         world_size = vllm_config.parallel_config.world_size
         if self.partition_by_group:
-            mamba_groups: set[int] = set()
+            mamba_groups: set[int] = self.mamba_groups
             mamba_spec: MambaSpec | None = None
             for i, group in cacheable_groups.items():
                 layer_names = set(group.layer_names)
@@ -146,6 +174,23 @@ class CPUOffloadingSpec(OffloadingSpec):
             block_size = mamba_spec.block_size * self.block_size_factor
             alignment_tokens = block_size
 
+            # Slots are per group, and a group whose offloaded block is finer
+            # than the alignment grid stores more blocks per token range: the
+            # sliding-window group holds one block per `alignment // block`
+            # token blocks. Uniform slot counts under-provision those groups by
+            # exactly that ratio, so their LRU evicts a prefix that the coarser
+            # groups still hold and a restore misses a whole request on a group
+            # whose data was never the same size.
+            group_block_sizes: dict[int, int] = {
+                i: kv_cache_config.kv_cache_groups[i].kv_cache_spec.block_size
+                * self.block_size_factor
+                for i in self.cpu_group_page_sizes
+            }
+
+            def token_slots(group_idx: int, num_token_blocks: int) -> int:
+                ratio = max(1, alignment_tokens // group_block_sizes[group_idx])
+                return num_token_blocks * ratio
+
             def state_slots(num_token_blocks: int) -> int:
                 return mamba_state_slots(
                     num_token_blocks,
@@ -158,7 +203,11 @@ class CPUOffloadingSpec(OffloadingSpec):
 
             def bytes_per_worker(num_token_blocks: int) -> int:
                 return (
-                    num_token_blocks * token_page
+                    sum(
+                        token_slots(i, num_token_blocks) * page
+                        for i, page in self.cpu_group_page_sizes.items()
+                        if i not in mamba_groups
+                    )
                     + state_slots(num_token_blocks) * state_page
                 )
 
@@ -176,7 +225,9 @@ class CPUOffloadingSpec(OffloadingSpec):
             self.num_blocks = num_blocks
             for i in self.cpu_group_page_sizes:
                 self.cpu_group_num_blocks[i] = (
-                    state_slots(num_blocks) if i in mamba_groups else num_blocks
+                    state_slots(num_blocks)
+                    if i in mamba_groups
+                    else token_slots(i, num_blocks)
                 )
             logger.info(
                 "Grouped CPU offload pool: %d token slots, %d state slots per "
@@ -191,6 +242,14 @@ class CPUOffloadingSpec(OffloadingSpec):
                 budget_per_worker,
                 self.retention_interval,
                 self.state_slots_reference_tokens,
+            )
+            logger.info(
+                "Grouped CPU offload per-group pages=%s slots=%s "
+                "block_sizes=%s alignment=%d",
+                {i: p for i, p in sorted(self.cpu_group_page_sizes.items())},
+                {i: n for i, n in sorted(self.cpu_group_num_blocks.items())},
+                {i: s for i, s in sorted(group_block_sizes.items())},
+                alignment_tokens,
             )
         else:
             total_gpu_kv_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
@@ -231,24 +290,31 @@ class CPUOffloadingSpec(OffloadingSpec):
             # Maximum entries in the internal tracker's LRU table.
             max_tracker_size = int(self.extra_config.get("max_tracker_size", 64_000))
 
-            def create_manager(num_blocks: int) -> CPUOffloadingManager:
+            def create_manager(
+                num_blocks: int, share_pages: bool, group_label: str = "-"
+            ) -> CPUOffloadingManager:
                 return CPUOffloadingManager(
                     num_blocks=num_blocks,
                     cache_policy=self.eviction_policy,  # type: ignore[arg-type]
                     enable_events=enable_events,
                     store_threshold=store_threshold,
                     max_tracker_size=max_tracker_size,
+                    share_pages=share_pages,
+                    group_label=group_label,
+                    partial_admit=not share_pages,
                 )
 
             self._manager = (
                 GroupedCPUOffloadingManager(
                     {
-                        i: create_manager(num_blocks)
+                        i: create_manager(
+                            num_blocks, share_pages=False, group_label=f"g{i}"
+                        )
                         for i, num_blocks in self.cpu_group_num_blocks.items()
                     }
                 )
                 if self.partition_by_group
-                else create_manager(self.num_blocks)
+                else create_manager(self.num_blocks, share_pages=True)
             )
         return self._manager
 

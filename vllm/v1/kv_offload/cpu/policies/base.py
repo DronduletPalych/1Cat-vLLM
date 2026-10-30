@@ -64,6 +64,10 @@ class CachePolicy(ABC):
         """Make the given keys the next eviction candidates (default: no-op)."""
         return
 
+    def iter_blocks(self) -> Iterable[tuple[OffloadKey, BlockStatus]]:
+        """Yield every cached (key, block). Diagnostics only, no LRU touch."""
+        return ()
+
     @abstractmethod
     def evict(
         self, n: int, protected: set[OffloadKey]
