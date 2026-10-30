@@ -261,7 +261,7 @@ class TestTieringOffloadingManager:
         assert count_hits(self.manager, blocks) == 3
 
     def test_eviction_in_primary_tier(self, manager_setup):
-        """An evicted block is copied to the secondary tiers before its slot is freed."""
+        """An evicted block is copied to the secondary tiers before its slot is reused."""
         # Primary tier has capacity of 5 blocks
         # First, fill the primary tier
         blocks = to_keys(range(5))
@@ -275,27 +275,19 @@ class TestTieringOffloadingManager:
 
         # Now try to store 2 more blocks (should trigger eviction). The two
         # victims are copied to both secondary tiers and their slots stay
-        # allocated until the copies land, so this step cannot admit anything.
+        # allocated until the copies land; the store waits for those copies, so
+        # it is admitted in the same step instead of being refused.
         more_blocks = to_keys(range(5, 7))
         result = self.manager.prepare_store(more_blocks, _CTX)
 
-        assert result is None
+        assert result is not None
+        assert len(result.keys_to_store) == 2
         for victim in to_keys(range(2)):
             assert self.secondary_tier1.lookup(victim, _CTX) is True
             assert self.secondary_tier2.lookup(victim, _CTX) is True
-        assert self.primary_tier.held_blocks() == 2
-
-        # The copies complete: the slots come back and the retry is admitted.
-        # A job submitted inside a step is first polled at the start of the next
-        # step (at most one poll per step), hence two end-of-step calls.
-        list(self.manager.take_events())
-        list(self.manager.take_events())
+            assert self.primary_tier.lookup(victim, _CTX) is False
         assert self.primary_tier.held_blocks() == 0
-
-        result = self.manager.prepare_store(more_blocks, _CTX)
-        assert result is not None
-        assert len(result.keys_to_store) == 2
-        assert not result.evicted_keys
+        assert self.primary_tier.refusal_stats()["blocks"] == 0
 
     def test_touch_propagates_to_all_tiers(self, manager_setup):
         """Test that touch() propagates to all tiers."""

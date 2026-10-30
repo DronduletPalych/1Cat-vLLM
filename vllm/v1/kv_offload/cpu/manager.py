@@ -34,6 +34,13 @@ EvictionCascade = Callable[
     [Sequence[tuple[OffloadKey, BlockStatus]], ReqContext], Collection[OffloadKey]
 ]
 
+# A reclaim handler polls the tier below for the copies started by an eviction
+# cascade, finishing them so the slots they pin come back to the pool. It gets
+# the number of slots the caller needs and a time budget in seconds, and returns
+# how many slots were returned. Waiting on it is what lets a full pool accept a
+# new block in the same call instead of refusing it.
+ReclaimHeldSlots = Callable[[int, float], int]
+
 _CACHE_POLICIES: dict[str, type[CachePolicy]] = {
     "lru": LRUCachePolicy,
     "arc": ARCCachePolicy,
@@ -100,14 +107,29 @@ class CPUOffloadingManager(OffloadingManager):
         # retry the tail keeps blocks flowing to the secondary tiers; a shared
         # page pool keeps the all-or-nothing contract.
         self.partial_admit: bool = partial_admit
-        self._admit_refusals: int = 0
         self._admit_last_log: float = 0.0
         # Slots whose data is being copied out of the pool before reuse (see
         # set_eviction_cascade). They are out of the policy and out of the free
         # list: the slot cannot be reallocated until release_held_blocks().
         self._eviction_cascade: EvictionCascade | None = None
+        self._eviction_reclaim: ReclaimHeldSlots | None = None
         self._held_block_ids: set[int] = set()
         self._cascaded_total: int = 0
+        # How long an admission may spend waiting for the copies of the slots it
+        # just evicted. A slot is not reusable until its copy lands, so waiting
+        # for the copy is what makes "pool full" an admission instead of a
+        # refusal. 0 disables the wait (the pool then refuses and the caller
+        # retries on a later step).
+        self.reclaim_timeout: float = (
+            float(os.environ.get("VLLM_EVICT_RECLAIM_TIMEOUT_MS", "250")) / 1000.0
+        )
+        self._reclaim_waits: int = 0
+        self._reclaim_wait_ms: int = 0
+        self._reclaim_timeouts: int = 0
+        # Blocks the pool could not place at all. `blocks`/`lost` count every
+        # refused key (an offer that produced no slot and no copy), so a refusal
+        # is visible in the loss accounting instead of hiding behind lost=0.
+        self._refusals: dict[str, int] = {"batches": 0, "blocks": 0, "lost": 0}
 
     # --- eviction cascade ---
 
@@ -120,6 +142,52 @@ class CPUOffloadingManager(OffloadingManager):
         release_held_blocks() puts it back on the free list.
         """
         self._eviction_cascade = cascade
+
+    def set_eviction_reclaim(self, reclaim: ReclaimHeldSlots) -> None:
+        """Install the handler that finishes in-flight eviction copies.
+
+        Without one, a slot held by a cascade is only released when the caller
+        comes back: a full pool then refuses the new block and the caller has to
+        retry. With one, the admission waits (bounded by ``reclaim_timeout``)
+        for the copy it just started, so the block it wanted to store is
+        accepted in the same call.
+        """
+        self._eviction_reclaim = reclaim
+
+    def _reclaim_held(self, wanted: int) -> int:
+        """Wait, bounded, for slots pinned by in-flight eviction copies.
+
+        Returns the number of slots that came back. A no-op when nothing is
+        held or no reclaim handler is installed, so a pool without a secondary
+        tier keeps its plain LRU behavior.
+        """
+        if wanted <= 0 or not self._held_block_ids:
+            return 0
+        if self._eviction_reclaim is None or self.reclaim_timeout <= 0:
+            return 0
+        held_before = len(self._held_block_ids)
+        start = time.monotonic()
+        try:
+            self._eviction_reclaim(wanted, self.reclaim_timeout)
+        except Exception:  # never let a broken tier abort an admission
+            logger.exception(
+                "FS-RECLAIM-ERROR grp=%s wanted=%d held=%d",
+                self.group_label,
+                wanted,
+                held_before,
+            )
+            return 0
+        finally:
+            elapsed = time.monotonic() - start
+            self._reclaim_waits += 1
+            self._reclaim_wait_ms += int(elapsed * 1000.0)
+            if len(self._held_block_ids) >= held_before:
+                self._reclaim_timeouts += 1
+        return held_before - len(self._held_block_ids)
+
+    def refusal_stats(self) -> dict[str, int]:
+        """Store refusals so far: (batches, blocks, blocks counted as lost)."""
+        return dict(self._refusals)
 
     def _release_evicted(
         self,
@@ -203,20 +271,28 @@ class CPUOffloadingManager(OffloadingManager):
         admitted: int = 0,
     ) -> None:
         """Record a store batch the pool cannot fully admit, with its composition."""
-        self._admit_refusals += 1
+        unserved = max(0, new - admitted)
+        self._refusals["batches"] += 1
+        self._refusals["blocks"] += unserved
+        # A key without a host slot never reaches a secondary tier, so a refused
+        # key is a lost block unless the caller manages to offer it again. It is
+        # counted here, once per offer, instead of vanishing into lost=0.
+        self._refusals["lost"] += unserved
         now = time.monotonic()
         if now - self._admit_last_log < 2.0:
             return
         self._admit_last_log = now
         evictable, pinned, not_ready = self._admit_composition(protected)
         logger.info(
-            "FS-ADMIT-REFUSE grp=%s reason=%s new=%d admitted=%d free=%d pool=%d "
-            "alloc=%d need_evict=%d evictable=%d pinned=%d not_ready=%d "
-            "protected=%d refusals=%d",
+            "FS-ADMIT-REFUSE grp=%s reason=%s new=%d admitted=%d unserved=%d free=%d "
+            "pool=%d alloc=%d need_evict=%d evictable=%d pinned=%d not_ready=%d "
+            "protected=%d held=%d refusals=%d refused_blocks=%d waits=%d "
+            "wait_ms=%d wait_timeouts=%d",
             self.group_label,
             reason,
             new,
             admitted,
+            unserved,
             self._get_num_free_blocks(),
             self._num_blocks,
             self._num_allocated_blocks,
@@ -225,13 +301,17 @@ class CPUOffloadingManager(OffloadingManager):
             pinned,
             not_ready,
             len(protected),
-            self._admit_refusals,
+            len(self._held_block_ids),
+            self._refusals["batches"],
+            self._refusals["blocks"],
+            self._reclaim_waits,
+            self._reclaim_wait_ms,
+            self._reclaim_timeouts,
         )
 
-    def _admit_capacity(self, protected: set[OffloadKey]) -> int:
-        """Keys this pool could accept right now: free slots plus evictable ones."""
-        evictable, _, _ = self._admit_composition(protected)
-        return self._get_num_free_blocks() + evictable
+    def reclaim_stats(self) -> tuple[int, int, int]:
+        """Bounded eviction-copy waits so far: (calls, total_ms, timeouts)."""
+        return (self._reclaim_waits, self._reclaim_wait_ms, self._reclaim_timeouts)
 
     def pool_stats(self) -> tuple[int, int, int, int, int, int]:
         """(pool, allocated, ready, pinned, not_ready, held) counts, diagnostics only."""
@@ -395,6 +475,11 @@ class CPUOffloadingManager(OffloadingManager):
             )
 
         num_blocks_to_evict = len(new_hashes) - self._get_num_free_blocks()
+        if num_blocks_to_evict > 0 and self._held_block_ids:
+            # A slot whose copy is already in flight comes back without evicting
+            # anything else: collect it before choosing victims.
+            self._reclaim_held(num_blocks_to_evict)
+            num_blocks_to_evict = len(new_hashes) - self._get_num_free_blocks()
 
         to_evict: list[OffloadKey] = []
         cascaded: list[OffloadKey] = []
@@ -422,10 +507,14 @@ class CPUOffloadingManager(OffloadingManager):
             freed, held = self._release_evicted(evicted, req_context)
             to_evict = [key for key, _ in freed]
             cascaded = [key for key, _ in held]
-            if len(cascaded) and self._get_num_free_blocks() < len(new_hashes):
+            if cascaded and self._get_num_free_blocks() < len(new_hashes):
+                # The victims' slots come back as soon as their copies land, so
+                # wait for the copies this eviction started instead of refusing.
+                self._reclaim_held(len(new_hashes) - self._get_num_free_blocks())
+            if cascaded and self._get_num_free_blocks() < len(new_hashes):
                 # Victims are being copied out and their slots are not free yet.
-                # Refusing keeps the all-or-nothing contract and loses nothing:
-                # the copy still lands, the caller retries this batch.
+                # Refusing keeps the all-or-nothing contract; the refusal is
+                # counted as lost so the channel stays visible.
                 self._log_admit_refusal(
                     len(new_hashes),
                     num_blocks_to_evict,
@@ -490,68 +579,85 @@ class CPUOffloadingManager(OffloadingManager):
                 evicted_keys=[],
             )
 
-        num_blocks_to_evict = len(keys_to_store) - self._get_num_free_blocks()
+        # A slot this pool evicted is not free until the copy that persists it
+        # lands. Collect those slots first: a copy already in flight returns its
+        # slot without evicting anything, and each new offer that evicts one more
+        # victim for the same admission only churns the pool.
+        free = self._get_num_free_blocks()
+        if len(keys_to_store) > free and self._held_block_ids:
+            self._reclaim_held(len(keys_to_store) - free)
+            free = self._get_num_free_blocks()
 
         deferred: tuple[OffloadKey, ...] = ()
         to_evict: list[OffloadKey] = []
         cascaded: list[OffloadKey] = []
-        if num_blocks_to_evict > 0:
+        need = len(keys_to_store) - free
+        if need > 0:
             protected = set(keys)
-            evicted = self._policy.evict(num_blocks_to_evict, protected)
-            if evicted is None:
-                requested = len(keys_to_store)
-                capacity = self._admit_capacity(protected) if self.partial_admit else 0
-                if capacity <= 0:
-                    self._log_admit_refusal(
-                        requested,
-                        num_blocks_to_evict,
-                        protected,
-                        "per-key pool full",
-                        0,
-                    )
-                    return None
-                # The pool cannot make room for the whole batch. Admit the
-                # leading part that fits and leave the rest to the caller's
-                # next attempt instead of refusing every key of the batch: a
-                # key without a host slot can never reach a secondary tier, so
-                # an all-or-nothing refusal loses the blocks the filesystem
-                # tier has room for.
-                deferred = tuple(keys_to_store[capacity:])
-                keys_to_store = keys_to_store[:capacity]
+            evictable, _, _ = self._admit_composition(protected)
+            if free == 0 and self._held_block_ids:
+                # No reusable slot anywhere and the copies that own the pinned
+                # ones did not land inside the budget. Evicting one more victim
+                # would pin a second slot for this same admission, so report the
+                # refusal (counted as lost) instead of churning the pool.
                 self._log_admit_refusal(
-                    requested,
-                    num_blocks_to_evict,
-                    protected,
-                    "per-key pool full, partial admit",
                     len(keys_to_store),
+                    need,
+                    protected,
+                    "slots pinned by eviction copies past the budget",
+                    0,
                 )
-                num_blocks_to_evict = len(keys_to_store) - self._get_num_free_blocks()
-                evicted = (
-                    self._policy.evict(num_blocks_to_evict, protected)
-                    if num_blocks_to_evict > 0
-                    else []
+                return None
+            want = min(need, evictable)
+            if want < need and not self.partial_admit:
+                self._log_admit_refusal(
+                    len(keys_to_store),
+                    need,
+                    protected,
+                    "per-key pool full",
+                    0,
                 )
-                if evicted is None:
-                    return None
-            # Every victim is either freed now or handed to the eviction cascade,
-            # which copies it to the slower tier before the slot is reusable.
-            freed, held = self._release_evicted(evicted, req_context)
-            to_evict = [key for key, _ in freed]
-            cascaded = [key for key, _ in held]
+                return None
+            if want <= 0 and free == 0:
+                # Nothing evictable and no free slot: a refusal is the only
+                # answer, and it is counted as a lost block.
+                self._log_admit_refusal(
+                    len(keys_to_store),
+                    need,
+                    protected,
+                    "per-key pool full",
+                    0,
+                )
+                return None
+            if want > 0:
+                # Evict, but never more victims than the pool has: an
+                # over-large request makes the policy refuse atomically, and
+                # that refusal would drop the whole batch.
+                evicted = self._policy.evict(want, protected)
+                # Every victim is either freed now or handed to the eviction
+                # cascade, which copies it to the slower tier before the slot is
+                # reusable.
+                freed, held = self._release_evicted(evicted or [], req_context)
+                to_evict = [key for key, _ in freed]
+                cascaded = [key for key, _ in held]
 
-        # Slots held by the cascade are not free until their copy lands, so this
-        # call may have less room than the batch needs. Keep the caller's order,
-        # store the leading part and defer the tail: the scheduler retries a
-        # deferred key on a later step and never advances past it.
+        # Slots held by the cascade are not free until their copy lands. Wait for
+        # those copies instead of refusing: the block the caller wants to store
+        # was accepted for exactly this reason.
         free = self._get_num_free_blocks()
+        if free < len(keys_to_store) and self._held_block_ids:
+            self._reclaim_held(len(keys_to_store) - free)
+            free = self._get_num_free_blocks()
+
         if free == 0 and keys_to_store:
-            # Every slot is either cached or held by an eviction copy. Refuse the
-            # batch instead of returning an empty store: the caller retries it,
-            # while an empty keys_to_store would tell the scheduler there is
-            # nothing left to store and the blocks would never be offered again.
+            # Every slot is cached, pinned by a transfer, or held by an eviction
+            # copy that missed the budget. Refuse the batch (and count it) instead
+            # of returning an empty store: the caller retries, while an empty
+            # keys_to_store would tell the scheduler there is nothing left to
+            # store and the blocks would never be offered again.
             self._log_admit_refusal(
                 len(keys_to_store) + len(deferred),
-                num_blocks_to_evict,
+                len(keys_to_store),
                 set(keys),
                 "all slots held by eviction copies",
                 0,
@@ -689,13 +795,21 @@ class GroupedCPUOffloadingManager(OffloadingManager):
         self._dropped_stateless_keys = 0
         self._gate_info: dict = {}
         self._stats_enabled = os.environ.get("VLLM_TIER_STATS") == "1"
-        # Per group: [in, adm, out, lost, ev, ref].
-        #   in   — blocks offered to this group's prepare_store
-        #   adm  — blocks admitted into the group's primary pool this call
-        #   out  — blocks the secondary tier CONFIRMED as written
-        #   lost — blocks that left the primary pool without that confirmation
-        #   ev   — blocks whose primary slot was released by an eviction
-        #   ref  — store batches the group refused (retried by the caller)
+        # Per group: [in, new, adm, def, out, lost, refused, casc, ref].
+        #   in      — blocks offered to this group's prepare_store (a retried key
+        #             is offered again and counted again)
+        #   new     — offered blocks the pool did not already hold, i.e. the ones
+        #             that need a slot
+        #   adm     — blocks admitted into the group's primary pool
+        #   def     — blocks the pool deferred to the caller's next attempt
+        #             (partial admit: no slot yet, retried, not lost)
+        #   out     — admitted stores the secondary tier CONFIRMED as written
+        #   lost    — blocks that left the pool without ever being persisted,
+        #             including refused blocks (a refusal has no slot, so it can
+        #             never reach a secondary tier)
+        #   refused — blocks in batches the group refused outright
+        #   casc    — eviction victims the secondary tier confirmed as written
+        #   ref     — store batches the group refused
         self._stats: dict[int, list[int]] = {}
         self._stats_last = time.monotonic()
         # Per group: [ram_hit_lookups, fs_hit_lookups]. Hits answered by the
@@ -712,16 +826,36 @@ class GroupedCPUOffloadingManager(OffloadingManager):
                         g, confirmed, lost
                     )
                 )
+            cascade_sink = getattr(manager, "set_cascade_outcome_sink", None)
+            if cascade_sink is not None:
+                cascade_sink(
+                    lambda confirmed, lost, g=group_idx: self._on_cascade_outcome(
+                        g, confirmed, lost
+                    )
+                )
             hit_sink = getattr(manager, "set_hit_sink", None)
             if hit_sink is not None:
                 hit_sink(lambda tier, g=group_idx: self._on_hit(g, tier))
 
     def _on_store_outcome(self, group_idx: int, confirmed: int, lost: int) -> None:
-        """Count blocks a secondary write confirmed (or dropped) for a group."""
+        """Count admitted stores a secondary tier confirmed (or dropped) per group."""
         if confirmed:
-            self._stats.setdefault(group_idx, [0, 0, 0, 0, 0, 0])[2] += confirmed
+            self._stats.setdefault(group_idx, [0] * 9)[4] += confirmed
         if lost:
-            self._stats.setdefault(group_idx, [0, 0, 0, 0, 0, 0])[3] += lost
+            self._stats.setdefault(group_idx, [0] * 9)[5] += lost
+        self._maybe_log_stats()
+
+    def _on_cascade_outcome(self, group_idx: int, confirmed: int, lost: int) -> None:
+        """Count eviction copies a secondary tier confirmed (or dropped) per group.
+
+        Kept apart from the store outcome: a cascade writes a block the pool had
+        already admitted, so counting it as `out` made `out` exceed `adm` and
+        hid stores that were written without ever being admitted.
+        """
+        if confirmed:
+            self._stats.setdefault(group_idx, [0] * 9)[7] += confirmed
+        if lost:
+            self._stats.setdefault(group_idx, [0] * 9)[5] += lost
         self._maybe_log_stats()
 
     def _on_hit(self, group_idx: int, tier: str) -> None:
@@ -742,7 +876,7 @@ class GroupedCPUOffloadingManager(OffloadingManager):
     def _bump_group(self, group_idx: int, slot: int, value: int) -> None:
         if not self._stats_enabled:
             return
-        self._stats.setdefault(group_idx, [0, 0, 0, 0, 0, 0])[slot] += value
+        self._stats.setdefault(group_idx, [0] * 9)[slot] += value
         self._maybe_log_stats()
 
     def _maybe_log_stats(self, force: bool = False) -> None:
@@ -753,7 +887,7 @@ class GroupedCPUOffloadingManager(OffloadingManager):
             return
         self._stats_last = now
         logger.info(
-            "GROUPED-STORE group_in_adm_out_lost_ev_ref=%s",
+            "GROUPED-STORE in_new_adm_def_out_lost_refused_casc_ref=%s",
             {g: tuple(v) for g, v in sorted(self._stats.items())},
         )
         # (pool, allocated, ready, pinned, not_ready, held) per group:
@@ -767,6 +901,20 @@ class GroupedCPUOffloadingManager(OffloadingManager):
                 for g, m in sorted(self.managers.items())
             },
         )
+        logger.info(
+            "FS-REFUSE group_ref_batches_ref_blocks_wait_calls_wait_ms_timeouts=%s",
+            {g: self._refuse_row(m) for g, m in sorted(self.managers.items())},
+        )
+
+    @staticmethod
+    def _refuse_row(manager: OffloadingManager) -> tuple[int, ...]:
+        """(refused batches, refused blocks, reclaim waits, ms, timeouts)."""
+        refusals = getattr(manager, "refusal_stats", None)
+        reclaim = getattr(manager, "reclaim_stats", None)
+        if refusals is None or reclaim is None:
+            return (0, 0, 0, 0, 0)
+        stats = refusals()
+        return (stats["batches"], stats["blocks"]) + reclaim()
 
     def _maybe_log_hits(self, force: bool = False) -> None:
         if not self._stats_enabled:
@@ -852,7 +1000,16 @@ class GroupedCPUOffloadingManager(OffloadingManager):
         refused_groups: list[int] = []
         for group_idx, group_keys in self._partition(keys).items():
             self._bump_group(group_idx, 0, len(group_keys))
-            output = self.managers[group_idx].prepare_store(group_keys, req_context)
+            manager = self.managers[group_idx]
+            # Blocks the pool does not hold yet are the ones that need a slot:
+            # `in` counts every offer (a retried key is offered again), `new` is
+            # what the pool has to place.
+            self._bump_group(
+                group_idx,
+                1,
+                sum(0 if manager.contains(key) else 1 for key in group_keys),
+            )
+            output = manager.prepare_store(group_keys, req_context)
             if output is None:
                 # This pool cannot take any of its keys right now. Keep the
                 # other groups' admissions instead of cancelling the batch: a
@@ -860,12 +1017,17 @@ class GroupedCPUOffloadingManager(OffloadingManager):
                 # tier either, so one starved group must not drop the blocks
                 # that do fit. The caller retries the refused keys.
                 refused_groups.append(group_idx)
-                self._bump_group(group_idx, 5, 1)
+                self._bump_group(group_idx, 8, 1)
+                # A refused key has no slot and no copy, so it is a block at
+                # risk of never being persisted: count it, or the channel stays
+                # invisible behind lost=0.
+                self._bump_group(group_idx, 6, len(group_keys))
+                self._bump_group(group_idx, 5, len(group_keys))
                 deferred_keys.extend(group_keys)
                 continue
             assert isinstance(output.store_spec, CPULoadStoreSpec)
-            self._bump_group(group_idx, 1, len(output.keys_to_store))
-            self._bump_group(group_idx, 4, len(output.evicted_keys))
+            self._bump_group(group_idx, 2, len(output.keys_to_store))
+            self._bump_group(group_idx, 3, len(output.deferred_keys))
             block_ids.update(
                 zip(output.keys_to_store, map(int, output.store_spec.block_ids))
             )

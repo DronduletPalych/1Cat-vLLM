@@ -361,6 +361,7 @@ class OffloadingConnectorScheduler:
             "deferred_stores": 0,
             "deferred_promotions": 0,
             "store_cannot_proceed": 0,
+            "store_deferred": 0,
         }
         self._defer_last_log = time.monotonic()
 
@@ -1051,6 +1052,12 @@ class OffloadingConnectorScheduler:
                 continue
 
             if not store_output.keys_to_store:
+                if store_output.deferred_keys:
+                    # The host tier placed nothing but still wants these keys
+                    # retried. Advancing the cursor here would drop them for
+                    # good, so leave it where it is and offer them again.
+                    self._defer_stats["store_deferred"] += 1
+                    continue
                 if _DBG_LOOKUP:
                     logger.info(
                         "OFFLOAD-STORE-NOKEYS req=%s tokens=%d cand=%d groups=%s",
@@ -1440,6 +1447,11 @@ class OffloadingConnectorScheduler:
                     continue
                 keys_to_store = set(store_output.keys_to_store)
                 if not keys_to_store:
+                    if store_output.deferred_keys:
+                        # Nothing placed, keys still queued for a slot: keep the
+                        # hand-off pending or it is never offered again.
+                        still_pending.extend(entries)
+                        continue
                     # Every key is already in the tier (an identical prefix was
                     # stored before). Nothing to transfer and nothing to retry.
                     continue
@@ -1642,10 +1654,12 @@ class OffloadingConnectorScheduler:
             st = self._defer_stats
             logger.info(
                 "OFFLOAD-DEFER deferred_stores=%d deferred_promotions=%d "
-                "store_cannot_proceed=%d pinned_blocks=%d inflight_jobs=%d",
+                "store_cannot_proceed=%d store_deferred=%d pinned_blocks=%d "
+                "inflight_jobs=%d",
                 st["deferred_stores"],
                 st["deferred_promotions"],
                 st["store_cannot_proceed"],
+                st["store_deferred"],
                 pinned,
                 len(self._jobs),
             )

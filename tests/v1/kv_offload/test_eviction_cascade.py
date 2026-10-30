@@ -5,14 +5,19 @@
 The contract these tests pin down:
 
 1. A block evicted from the RAM tier is submitted to the secondary tier BEFORE
-   its slot is released, and the slot is released only once the copy is
-   confirmed (``pool full`` test).
-2. A copy that fails or is refused is reported and counted as lost, with the
-   slot released anyway — a broken disk must not pin the whole pool, and the
-   block must never be reported as present (``copy fails`` test).
-3. A promotion into a full primary tier does not consume a slot that a copy is
-   still reading; it is reported as a miss and succeeds on a later step
-   (``partial promotion`` test).
+   its slot is reused, and the slot is reused only once the copy is confirmed
+   (``full pool`` test). The store that needed the slot is accepted in the same
+   call: it waits, bounded, for the copy its own eviction started instead of
+   being refused and retried by a caller that may have no step left.
+2. A copy that fails is reported and counted as lost, with the slot released
+   anyway — a broken disk must not pin the whole pool, and the block must never
+   be reported as present (``copy fails`` test).
+3. A copy that misses the budget, or a pool whose blocks are all pinned by
+   transfers, makes the store refuse; that refusal is counted as lost instead of
+   hiding behind ``lost=0`` (``pinned pool`` test).
+4. A promotion into a full primary tier evicts and waits like any other store,
+   so a filesystem hit is not thrown away just because the pool is full
+   (``promotion`` test).
 """
 
 import torch
@@ -42,18 +47,22 @@ def to_keys(numbers) -> list[OffloadKey]:
 
 
 class _ControllableTier(SecondaryTierManager):
-    """Secondary tier whose jobs finish only when the test says so."""
+    """Secondary tier whose copies land immediately, or only when told."""
 
-    def __init__(self, primary_kv_view, tier_type="fake"):
+    def __init__(self, primary_kv_view, tier_type="fake", auto=True):
         super().__init__(
             offloading_spec=None,  # type: ignore[arg-type]
             primary_kv_view=primary_kv_view,
             tier_type=tier_type,
         )
+        self.auto = auto
+        self.fail_next_store = False
+        self.fail_next_load = False
         self.stored: set[OffloadKey] = set()
         self.pending: dict[int, tuple[JobMetadata, bool]] = {}
-        self._next_id = 0
+        self.finished: list[tuple[int, bool]] = []
         self.store_calls: list[list[OffloadKey]] = []
+        self.load_calls: list[list[OffloadKey]] = []
 
     # --- SecondaryTierManager -------------------------------------------
     def lookup(self, key, req_context=None):
@@ -61,29 +70,37 @@ class _ControllableTier(SecondaryTierManager):
 
     def submit_store(self, job_metadata: JobMetadata) -> None:
         self.store_calls.append(list(job_metadata.keys))
-        self.pending[job_metadata.job_id] = (job_metadata, True)
+        self._queue(job_metadata, not self.fail_next_store)
 
     def submit_load(self, job_metadata: JobMetadata) -> None:
-        self.pending[job_metadata.job_id] = (job_metadata, True)
+        self.load_calls.append(list(job_metadata.keys))
+        self._queue(job_metadata, not self.fail_next_load)
 
     def get_finished_jobs(self):
-        done = list(self.pending.items())
-        self.pending.clear()
-        results = []
-        for job_id, (metadata, ok) in done:
-            if ok:
-                self.stored.update(metadata.keys)
-            results.append(JobResult(job_id=job_id, success=ok))
+        results = [
+            JobResult(job_id=job_id, success=success)
+            for job_id, success in self.finished
+        ]
+        self.finished.clear()
         return results
 
     def on_new_request(self, req_context):
         return RequestOffloadingContext()
 
     # --- test helpers ----------------------------------------------------
-    def finish(self, ok: bool = True) -> None:
-        for job_id in list(self.pending):
-            metadata, _ = self.pending[job_id]
-            self.pending[job_id] = (metadata, ok)
+    def _queue(self, job_metadata: JobMetadata, ok: bool) -> None:
+        self.pending[job_metadata.job_id] = (job_metadata, ok)
+        if self.auto:
+            self.finish(ok)
+
+    def finish(self, ok: bool | None = None) -> None:
+        """Complete every queued copy now (optionally forcing its outcome)."""
+        for job_id, (metadata, success) in list(self.pending.items()):
+            self.pending.pop(job_id)
+            success = success if ok is None else ok
+            if success:
+                self.stored.update(metadata.keys)
+            self.finished.append((job_id, success))
 
 
 def _mock_region(num_blocks: int):
@@ -99,14 +116,14 @@ def _mock_region(num_blocks: int):
     return _Region(num_blocks)
 
 
-def _build(num_blocks: int):
+def _build(num_blocks: int, auto: bool = True):
     region = _mock_region(num_blocks)
     # Mirrors TieringOffloadingSpec: a grouped pool admits the leading part of
     # an oversized batch and defers the tail.
     primary = CPUPrimaryTierOffloadingManager(
         num_blocks=num_blocks, mmap_region=region, partial_admit=True
     )
-    tier = _ControllableTier(primary.get_kv_memoryview())
+    tier = _ControllableTier(primary.get_kv_memoryview(), auto=auto)
     manager = TieringOffloadingManager(primary_tier=primary, secondary_tiers=[tier])
     return primary, tier, manager
 
@@ -137,34 +154,69 @@ def _fill(manager, primary, keys):
     return output
 
 
-def test_pool_full_writes_victim_before_freeing_the_slot():
+def test_pool_full_writes_victim_before_reusing_its_slot():
     primary, tier, manager = _build(num_blocks=2)
     _fill(manager, primary, to_keys(range(2)))
     tier.pending.clear()  # cascade jobs settled by _fill; start clean
     assert tier.stored == set(to_keys(range(2)))
 
-    # The pool is full: storing a third block must evict a victim, and the
-    # victim must reach the secondary tier before the slot is reusable.
+    # The pool is full: storing a third block must evict a victim, persist it,
+    # and reuse its slot inside the same call.
     new_keys = to_keys([2])
     output = manager.prepare_store(new_keys, _CTX)
 
-    assert output is None  # nothing admitted this step
+    assert output is not None
+    assert list(output.keys_to_store) == new_keys
     assert tier.store_calls[-1] == to_keys([0])  # the LRU victim was submitted
-    assert primary.held_blocks() == 1  # its slot is still allocated
+    assert tier.lookup(to_keys([0])[0], _CTX) is True  # and it landed
     assert manager.primary_tier.lookup(to_keys([0])[0], _CTX) is False
+    # The store waited for the copy instead of being refused, and nothing was
+    # dropped on the way.
+    assert primary.held_blocks() == 0
+    assert primary.refusal_stats() == {"batches": 0, "blocks": 0, "lost": 0}
+    assert manager._stats["evict_cascaded"] == 1
+    assert manager._stats["evict_lost"] == 0
+    assert manager._stats["evict_wait_calls"] >= 1
 
-    # Confirm the copy: the slot comes back and the retry is admitted.
+    # The slot is really reusable: the next block is admitted (evicting a new
+    # victim, since the pool is full again) without any refusal.
+    tier.store_calls.clear()
+    output = manager.prepare_store(to_keys([3]), _CTX)
+    assert output is not None
+    assert list(output.keys_to_store) == to_keys([3])
+    assert tier.store_calls == [to_keys([1])]
+    assert primary.refusal_stats() == {"batches": 0, "blocks": 0, "lost": 0}
+
+
+def test_copy_that_misses_the_budget_refuses_and_counts_the_loss():
+    primary, tier, manager = _build(num_blocks=2)
+    _fill(manager, primary, to_keys(range(2)))
+    # From here on the tier holds its copies: they cannot land inside the pool's
+    # budget, and the store must not silently disappear.
+    primary.reclaim_timeout = 0.02
+    tier.auto = False
+
+    output = manager.prepare_store(to_keys([2]), _CTX)
+    assert output is None
+    assert tier.store_calls[-1] == to_keys([0])  # the victim was still submitted
+    assert primary.held_blocks() == 1  # and its slot stays pinned by the copy
+
+    # The refusal is visible: one batch, one block, counted as lost.
+    assert primary.refusal_stats() == {"batches": 1, "blocks": 1, "lost": 1}
+    assert manager._stats["evict_lost"] == 0  # the copy itself did not fail
+
+    # A second offer does not evict a second victim for the same admission.
+    assert manager.prepare_store(to_keys([2]), _CTX) is None
+    assert len(tier.store_calls) == 2  # 1 batch from _fill + 1: no churn
+
+    # Once the copy lands the slot comes back and the block is admitted.
+    tier.auto = True
     tier.finish(ok=True)
     _settle(manager)
     assert primary.held_blocks() == 0
-
-    output = manager.prepare_store(new_keys, _CTX)
+    output = manager.prepare_store(to_keys([2]), _CTX)
     assert output is not None
-    assert list(output.keys_to_store) == new_keys
-    assert not output.evicted_keys
-
-    # The evicted block is still reachable, now from the slower tier.
-    assert tier.lookup(to_keys([0])[0], _CTX) is True
+    assert list(output.keys_to_store) == to_keys([2])
 
 
 def test_failed_copy_frees_the_slot_and_is_counted_as_lost():
@@ -175,51 +227,72 @@ def test_failed_copy_frees_the_slot_and_is_counted_as_lost():
     # Model the realistic case: the victim's earlier cascade never landed (the
     # FS tier rejected it), so it is only in the RAM tier.
     tier.stored.clear()
-
-    output = manager.prepare_store(to_keys([2]), _CTX)
-    assert output is None
-    assert primary.held_blocks() == 1
+    tier.fail_next_store = True
 
     # The write fails (disk full / I/O error). The block must not linger as
-    # pinned, must not be claimed as stored, and must be counted as lost.
-    tier.finish(ok=False)
-    _settle(manager)
+    # pinned, must not be claimed as stored, must be counted as lost, and the
+    # waiting store must still get the slot the failure released.
+    output = manager.prepare_store(to_keys([2]), _CTX)
 
+    assert output is not None
+    assert list(output.keys_to_store) == to_keys([2])
     assert primary.held_blocks() == 0
     assert tier.lookup(to_keys([0])[0], _CTX) is False
     assert manager._stats["evict_lost"] == 1
     assert manager._stats["evict_cascaded"] == 1  # the eviction-path cascade
+    assert primary.refusal_stats()["blocks"] == 0
 
-    # The pool is usable again rather than pinned by the failure.
+
+def test_all_pinned_pool_refuses_and_counts_the_loss():
+    """No evictable block: the refusal is the only correct answer, and it is
+
+    counted instead of vanishing into lost=0.
+    """
+    primary, tier, manager = _build(num_blocks=2)
+    keys = to_keys(range(2))
+    _fill(manager, primary, keys)
+    tier.pending.clear()
+    tier.store_calls.clear()
+
+    # Both slots are used as transfer sources (an in-flight GPU load): the
+    # policy refuses to evict them.
+    spec = primary.prepare_load(keys, _CTX)
+    assert spec is not None
+
+    output = manager.prepare_store(to_keys([2]), _CTX)
+    assert output is None
+    assert tier.store_calls == []  # nothing could be evicted, nothing written
+    assert primary.refusal_stats() == {"batches": 1, "blocks": 1, "lost": 1}
+    assert primary.free_slots() == 0
+
+    # Pinning is what blocked it: release the loads and the store goes through.
+    primary.complete_load(keys, _CTX)
     output = manager.prepare_store(to_keys([2]), _CTX)
     assert output is not None
     assert list(output.keys_to_store) == to_keys([2])
 
 
-def test_promotion_does_not_steal_a_slot_held_by_a_copy():
+def test_promotion_evicts_and_waits_instead_of_missing():
     primary, tier, manager = _build(num_blocks=2)
     _fill(manager, primary, to_keys(range(2)))
+    tier.pending.clear()
+    tier.store_calls.clear()
 
     # Candidate for promotion: present only in the slower tier.
-    assert tier.lookup(to_keys([9])[0], _CTX) is False
-    tier.stored.add(to_keys([9])[0])
+    promoted = to_keys([9])
+    assert tier.lookup(promoted[0], _CTX) is False
+    tier.stored.add(promoted[0])
 
-    # Fill the pool and start a victim copy so no slot is free.
-    tier.pending.clear()
-    assert manager.prepare_store(to_keys([2]), _CTX) is None
-    assert primary.held_blocks() == 1
+    # The pool is full, so the promotion has to evict and reuse a victim's slot.
+    assert manager.lookup(promoted[0], _CTX) is None  # promotion started
+    assert tier.store_calls[-1] == to_keys([0])  # the LRU victim was persisted
+    assert tier.lookup(to_keys([0])[0], _CTX) is True
 
-    # The promotion cannot start: treating it as a hit would hand the GPU a
-    # slot whose bytes are being read by the eviction copy.
-    assert manager.lookup(to_keys([9])[0], _CTX) is False
-    assert primary.held_blocks() == 1
-
-    # After the copy lands there is room, and the promotion goes through.
-    tier.finish(ok=True)
-    _settle(manager)
-    assert manager.lookup(to_keys([9])[0], _CTX) is None  # promotion started
-    _settle(manager)
-    assert manager.lookup(to_keys([9])[0], _CTX) is True
+    _settle(manager)  # flushes the batched submit_load and completes it
+    assert tier.load_calls[-1] == promoted
+    assert manager.lookup(promoted[0], _CTX) is True
+    # The promotion was not refused for lack of a slot.
+    assert manager._stats["promo_refused_blocks"] == 0
 
 
 def test_deduplication_leaves_tier_side_dedupe_in_charge():
@@ -234,7 +307,8 @@ def test_deduplication_leaves_tier_side_dedupe_in_charge():
     tier.pending.clear()
 
     calls_before = len(tier.store_calls)
-    assert manager.prepare_store(to_keys([2]), _CTX) is None
+    output = manager.prepare_store(to_keys([2]), _CTX)
+    assert output is not None
     assert len(tier.store_calls) == calls_before + 1
     # The victim was seen before by this tier: it is submitted again and the
     # tier answers with its own no-op, never with a silent skip here.
@@ -246,15 +320,10 @@ def test_cascaded_keys_are_reported_to_the_caller():
     _fill(manager, primary, to_keys([0]))
     tier.pending.clear()
 
-    output = manager.prepare_store(to_keys([1, 2]), _CTX)
-    # With a single slot and its only victim in flight, nothing can be admitted
-    # and the caller is told to retry — never "everything is stored".
-    assert output is None
-    assert primary.held_blocks() == 1
-
-    tier.finish(ok=True)
-    list(manager.take_events())
+    # One slot, one victim: the victim's slot is reused for the first key and
+    # the rest of the batch is deferred (never "everything is stored").
     output = manager.prepare_store(to_keys([1, 2]), _CTX)
     assert output is not None
-    assert len(output.keys_to_store) == 1
+    assert list(output.keys_to_store) == to_keys([1])
     assert list(output.deferred_keys) == to_keys([2])
+    assert output.cascaded_keys == tuple(to_keys([0]))
