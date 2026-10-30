@@ -23,8 +23,9 @@ Key Design Principles:
 import os
 import time
 from collections import defaultdict
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
@@ -63,6 +64,22 @@ class PendingPromotion:
     block_ids: list[int] = field(default_factory=list)
 
 
+@dataclass
+class EvictionBatch:
+    """Blocks evicted from the primary tier and being copied to the secondaries.
+
+    Their primary slots stay allocated until every tier reports the copy done
+    (or failed): the copy reads the slot, so freeing it earlier would write a
+    later block over the bytes mid-flight. This is the write-through half of
+    eviction — without it a victim that was never cascaded is lost for good.
+    """
+
+    keys: list[OffloadKey]
+    block_ids: list[int]
+    remaining: int
+    success: bool = True
+
+
 class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
     """CPUOffloadingManager with a primary/secondary transfer interface.
 
@@ -79,6 +96,8 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         mmap_region: SharedOffloadRegion,
         cache_policy: str = "lru",
         enable_events: bool = False,
+        partial_admit: bool = False,
+        group_label: str = "-",
     ):
         super().__init__(
             num_blocks=num_blocks,
@@ -87,6 +106,8 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
             # Secondary tiers promote asynchronously; the scheduler must retry
             # rather than treat an in-flight promotion as a miss.
             defer_inflight_lookup=True,
+            partial_admit=partial_admit,
+            group_label=group_label,
         )
         self._mmap_region = mmap_region
         # read/write is for CPU<->secondary transfers,
@@ -187,8 +208,102 @@ class TieringOffloadingManager(OffloadingManager):
             "promo_fail": 0,
             "miss": 0,
             "store_failures": 0,
+            "evict_cascaded": 0,
+            "evict_lost": 0,
         }
         self._stats_last = time.monotonic()
+
+        # Evicted blocks whose copy to the secondary tiers is in flight. Their
+        # primary slots stay allocated until the copy lands.
+        self._eviction_jobs: dict[JobId, EvictionBatch] = {}
+
+        # Optional per-group sinks installed by the grouped pool, so the
+        # in/out/lost accounting reaches the single place that logs it.
+        self._store_outcome_sink: Callable[[int, int], None] | None = None
+        self._hit_sink: Callable[[str], None] | None = None
+
+        # Write-through on eviction: a victim is copied to the secondary tiers
+        # BEFORE its primary slot is released. Without a secondary tier there is
+        # nothing to copy to and the primary pool keeps its plain LRU behavior.
+        if self.secondary_tiers:
+            self.primary_tier.set_eviction_cascade(self._cascade_evicted)
+
+    def set_store_outcome_sink(self, sink: Callable[[int, int], None]) -> None:
+        """Install a per-group callback for (confirmed_in_fs, lost) block counts."""
+        self._store_outcome_sink = sink
+
+    def set_hit_sink(self, sink: Callable[[str], None]) -> None:
+        """Install a per-group callback that reports which tier served a hit."""
+        self._hit_sink = sink
+
+    def _report_store_outcome(self, confirmed: int, lost: int) -> None:
+        if self._store_outcome_sink is not None:
+            self._store_outcome_sink(confirmed, lost)
+
+    def _cascade_evicted(
+        self,
+        evicted: Sequence[tuple[OffloadKey, Any]],
+        req_context: ReqContext,
+    ) -> set[OffloadKey]:
+        """Copy primary-tier victims to every secondary tier before freeing them.
+
+        Called from the primary pool's eviction path. The victims are already
+        unlinked from the primary policy; their slots are still allocated and
+        hold the bytes, which is all a secondary tier needs to read them. The
+        returned keys are the ones whose slot the pool must keep: it is released
+        in _process_finished_jobs() once the copy is confirmed.
+
+        The tiers deduplicate themselves (a block already on disk is not
+        rewritten), so re-submitting a victim that a previous cascade persisted
+        costs one stat() and no I/O.
+        """
+        if not self.secondary_tiers or not evicted:
+            return set()
+
+        keys = [key for key, _ in evicted]
+        block_ids = np.array([int(block.block_id) for _, block in evicted], dtype=np.int64)
+        batch = EvictionBatch(
+            keys=keys,
+            block_ids=[int(b) for b in block_ids],
+            remaining=len(self.secondary_tiers),
+        )
+        submitted = 0
+        for tier in self.secondary_tiers:
+            job_id = self._next_job_id()
+            job_metadata = JobMetadata(
+                job_id=job_id,
+                keys=keys,
+                block_ids=block_ids,
+                is_promotion=False,
+                req_context=req_context,
+            )
+            self._transfer_jobs[job_id] = job_metadata
+            self._eviction_jobs[job_id] = batch
+            try:
+                tier.submit_store(job_metadata)
+            except Exception:
+                logger.exception(
+                    "OFFLOAD-EVICT-CASCADE-ERROR tier=%s job=%s keys=%d",
+                    tier.tier_type,
+                    job_id,
+                    len(keys),
+                )
+                self._transfer_jobs.pop(job_id, None)
+                self._eviction_jobs.pop(job_id, None)
+                batch.remaining -= 1
+                batch.success = False
+            else:
+                submitted += 1
+
+        if batch.remaining == 0:
+            # Every submit failed synchronously: nothing holds the slots.
+            self._stats["evict_lost"] += len(keys)
+            self._report_store_outcome(0, len(keys))
+            return set()
+
+        if submitted:
+            self._stats["evict_cascaded"] += len(keys)
+        return set(keys)
 
     def _next_job_id(self) -> JobId:
         """Generate a unique job ID for async transfer tracking."""
@@ -229,6 +344,11 @@ class TieringOffloadingManager(OffloadingManager):
                     f" ({tier.tier_type}) not in _transfer_jobs"
                 )
 
+                eviction_batch = self._eviction_jobs.pop(job_id, None)
+                if eviction_batch is not None:
+                    self._finish_eviction_job(tier, completed_job, eviction_batch)
+                    continue
+
                 if job_metadata.is_promotion:
                     # secondary→primary transfer (promotion) completed.
                     # Make blocks available in primary tier.
@@ -254,11 +374,50 @@ class TieringOffloadingManager(OffloadingManager):
                             len(job_metadata.keys),
                             self._stats["store_failures"],
                         )
+                    else:
+                        # The blocks are on disk: this is the `out` number of
+                        # the per-group save accounting.
+                        self._report_store_outcome(len(job_metadata.keys), 0)
                     # Decrement ref_cnt on primary blocks (also on failure:
                     # the slots must become evictable again).
                     self.primary_tier.complete_read(
                         job_metadata.keys, job_metadata.req_context
                     )
+
+    def _finish_eviction_job(
+        self, tier: SecondaryTierManager, completed_job, batch: EvictionBatch
+    ) -> None:
+        """Conclude one eviction-copy job; free the slots when the batch is done.
+
+        A failed copy is not silent: it is logged and counted as `lost`, and the
+        slot is released anyway so a broken disk cannot pin the whole pool.
+        """
+        batch.remaining -= 1
+        if not completed_job.success:
+            batch.success = False
+            self._stats["store_failures"] += 1
+            logger.warning(
+                "OFFLOAD-EVICT-STORE-FAIL tier=%s job=%s keys=%d store_failures=%d",
+                tier.tier_type,
+                completed_job.job_id,
+                len(batch.keys),
+                self._stats["store_failures"],
+            )
+        if batch.remaining > 0:
+            return
+
+        released = self.primary_tier.release_held_blocks(batch.block_ids)
+        if batch.success:
+            self._report_store_outcome(len(batch.keys), 0)
+        else:
+            self._stats["evict_lost"] += len(batch.keys)
+            self._report_store_outcome(0, len(batch.keys))
+            logger.warning(
+                "OFFLOAD-EVICT-LOST keys=%d released_slots=%d lost_total=%d",
+                len(batch.keys),
+                released,
+                self._stats["evict_lost"],
+            )
 
     def _bump(self, name: str) -> None:
         """Count a lookup outcome and log the running totals every 10 s."""
@@ -271,7 +430,8 @@ class TieringOffloadingManager(OffloadingManager):
             st = self._stats
             logger.info(
                 "TIER-STATS primary_hit=%d primary_inflight=%d sec_lookup=%d "
-                "sec_hit=%d promo_ok=%d promo_fail=%d miss=%d store_failures=%d",
+                "sec_hit=%d promo_ok=%d promo_fail=%d miss=%d store_failures=%d "
+                "evict_cascaded=%d evict_lost=%d",
                 st["primary_hit"],
                 st["primary_inflight"],
                 st["sec_lookup"],
@@ -280,6 +440,8 @@ class TieringOffloadingManager(OffloadingManager):
                 st["promo_fail"],
                 st["miss"],
                 st["store_failures"],
+                st["evict_cascaded"],
+                st["evict_lost"],
             )
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
@@ -308,6 +470,8 @@ class TieringOffloadingManager(OffloadingManager):
         primary_hit = self.primary_tier.lookup(key, req_context)
         if primary_hit is True:
             self._bump("primary_hit")
+            if self._hit_sink is not None:
+                self._hit_sink("ram")
             return True
         if primary_hit is None:
             self._bump("primary_inflight")
@@ -323,6 +487,10 @@ class TieringOffloadingManager(OffloadingManager):
                     self._bump("promo_fail")
                     return False  # primary full, block unavailable
                 self._bump("promo_ok")
+                # Answered by the slower tier: this is the hit an aggregate
+                # external-hit counter hides when the FS tier is idle.
+                if self._hit_sink is not None:
+                    self._hit_sink("fs")
                 return None  # promotion started, retry later
             if result is None:
                 any_none = True
@@ -359,11 +527,23 @@ class TieringOffloadingManager(OffloadingManager):
         # Must happen immediately so primary.lookup() returns None (in-flight)
         # for this key on any subsequent lookup() call within the same step,
         # preventing duplicate promotion attempts.
+        if self.secondary_tiers and self.primary_tier.free_slots() <= 0:
+            # Every slot is cached or held by an in-flight eviction copy. A
+            # store attempt would evict a victim that cannot be reused until its
+            # own copy lands, i.e. it would churn the pool without making room.
+            # Report a miss; a later step retries once a copy finishes.
+            return False
         primary_write_result = self.primary_tier.prepare_write([key], req_context)
 
         if primary_write_result is None:
             # Primary tier is full; caller should treat the block as unavailable
             # rather than retrying indefinitely.
+            return False
+
+        if not primary_write_result.keys_to_store:
+            # The pool reported no refusal but had no room to allocate (its
+            # slots are held by in-flight eviction copies), so no destination
+            # block exists yet. Treat it as a miss and let a later step retry.
             return False
 
         store_spec = primary_write_result.store_spec
@@ -445,7 +625,7 @@ class TieringOffloadingManager(OffloadingManager):
         """Demote in the CPU tier; secondary tiers keep their own policy."""
         self.primary_tier.demote(keys, req_context)
 
-    def pool_stats(self) -> tuple[int, int, int, int, int]:
+    def pool_stats(self) -> tuple[int, int, int, int, int, int]:
         """Slot accounting of the primary pool, delegated to the tier that owns it."""
         return self.primary_tier.pool_stats()
 
@@ -573,7 +753,17 @@ class TieringOffloadingManager(OffloadingManager):
         self.primary_tier.complete_store(keys, req_context, success)
 
         if not success:
-            # If GPU→Primary transfer failed, don't cascade to secondary tiers
+            # The GPU→primary copy failed: the blocks are dropped from the pool
+            # and can never reach a secondary tier. Count them as lost instead of
+            # letting them vanish from the accounting.
+            if keys and self.secondary_tiers:
+                self._stats["evict_lost"] += len(keys)
+                self._report_store_outcome(0, len(keys))
+                logger.warning(
+                    "OFFLOAD-STORE-DROPPED keys=%d lost_total=%d",
+                    len(keys),
+                    self._stats["evict_lost"],
+                )
             return
 
         # Step 2: Cascade to ALL secondary tiers

@@ -89,6 +89,11 @@ class PrepareStoreOutput:
     # not treat them as stored-and-done: it retries them on a later step. Empty
     # means every offered key was either stored now or already held.
     deferred_keys: tuple[OffloadKey, ...] = ()
+    # Keys evicted from this tier whose data is being copied to a slower tier
+    # before their slot is released. They are already gone from this tier (a
+    # lookup misses), but their slot is not reusable yet: freeing it here would
+    # overwrite the bytes the copy is reading.
+    cascaded_keys: tuple[OffloadKey, ...] = ()
 
 
 @dataclass
