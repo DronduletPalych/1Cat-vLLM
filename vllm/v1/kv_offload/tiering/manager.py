@@ -206,10 +206,14 @@ class TieringOffloadingManager(OffloadingManager):
             "sec_hit": 0,
             "promo_ok": 0,
             "promo_fail": 0,
+            "promo_refused_blocks": 0,
             "miss": 0,
             "store_failures": 0,
             "evict_cascaded": 0,
             "evict_lost": 0,
+            "evict_wait_calls": 0,
+            "evict_wait_ms": 0,
+            "evict_wait_timeouts": 0,
         }
         self._stats_last = time.monotonic()
 
@@ -220,6 +224,7 @@ class TieringOffloadingManager(OffloadingManager):
         # Optional per-group sinks installed by the grouped pool, so the
         # in/out/lost accounting reaches the single place that logs it.
         self._store_outcome_sink: Callable[[int, int], None] | None = None
+        self._cascade_outcome_sink: Callable[[int, int], None] | None = None
         self._hit_sink: Callable[[str], None] | None = None
 
         # Write-through on eviction: a victim is copied to the secondary tiers
@@ -227,10 +232,17 @@ class TieringOffloadingManager(OffloadingManager):
         # nothing to copy to and the primary pool keeps its plain LRU behavior.
         if self.secondary_tiers:
             self.primary_tier.set_eviction_cascade(self._cascade_evicted)
+            # ... and the pool may wait (bounded) for those copies instead of
+            # refusing the store that needed the slot.
+            self.primary_tier.set_eviction_reclaim(self._drain_eviction_copies)
 
     def set_store_outcome_sink(self, sink: Callable[[int, int], None]) -> None:
         """Install a per-group callback for (confirmed_in_fs, lost) block counts."""
         self._store_outcome_sink = sink
+
+    def set_cascade_outcome_sink(self, sink: Callable[[int, int], None]) -> None:
+        """Install a per-group callback for eviction-copy (confirmed, lost) counts."""
+        self._cascade_outcome_sink = sink
 
     def set_hit_sink(self, sink: Callable[[str], None]) -> None:
         """Install a per-group callback that reports which tier served a hit."""
@@ -239,6 +251,43 @@ class TieringOffloadingManager(OffloadingManager):
     def _report_store_outcome(self, confirmed: int, lost: int) -> None:
         if self._store_outcome_sink is not None:
             self._store_outcome_sink(confirmed, lost)
+
+    def _report_cascade_outcome(self, confirmed: int, lost: int) -> None:
+        if self._cascade_outcome_sink is not None:
+            self._cascade_outcome_sink(confirmed, lost)
+
+    def _drain_eviction_copies(self, wanted: int, budget_s: float) -> int:
+        """Finish the eviction copies that pin slots, bounded by ``budget_s``.
+
+        Installed on the primary pool as its reclaim handler: when a store or a
+        promotion needs a slot and the only candidates are slots whose copy is
+        still in flight, the pool waits here instead of refusing. Every poll can
+        also release blocks pinned by an ordinary store job, so the wait usually
+        returns a slot well before the budget runs out.
+
+        Returns the number of slots that came back to the pool.
+        """
+        if not self._eviction_jobs or budget_s <= 0:
+            return 0
+        base_free = self.primary_tier.free_slots()
+        deadline = time.monotonic() + budget_s
+        delay = 0.0002
+        self._stats["evict_wait_calls"] += 1
+        start = time.monotonic()
+        gained = 0
+        try:
+            while True:
+                self._process_finished_jobs()
+                gained = self.primary_tier.free_slots() - base_free
+                if gained >= wanted or not self._eviction_jobs:
+                    return gained
+                if time.monotonic() >= deadline:
+                    self._stats["evict_wait_timeouts"] += 1
+                    return gained
+                time.sleep(delay)
+                delay = min(delay * 2, 0.005)
+        finally:
+            self._stats["evict_wait_ms"] += int((time.monotonic() - start) * 1000.0)
 
     def _cascade_evicted(
         self,
@@ -408,10 +457,10 @@ class TieringOffloadingManager(OffloadingManager):
 
         released = self.primary_tier.release_held_blocks(batch.block_ids)
         if batch.success:
-            self._report_store_outcome(len(batch.keys), 0)
+            self._report_cascade_outcome(len(batch.keys), 0)
         else:
             self._stats["evict_lost"] += len(batch.keys)
-            self._report_store_outcome(0, len(batch.keys))
+            self._report_cascade_outcome(0, len(batch.keys))
             logger.warning(
                 "OFFLOAD-EVICT-LOST keys=%d released_slots=%d lost_total=%d",
                 len(batch.keys),
@@ -430,18 +479,23 @@ class TieringOffloadingManager(OffloadingManager):
             st = self._stats
             logger.info(
                 "TIER-STATS primary_hit=%d primary_inflight=%d sec_lookup=%d "
-                "sec_hit=%d promo_ok=%d promo_fail=%d miss=%d store_failures=%d "
-                "evict_cascaded=%d evict_lost=%d",
+                "sec_hit=%d promo_ok=%d promo_fail=%d promo_refused_blocks=%d "
+                "miss=%d store_failures=%d evict_cascaded=%d evict_lost=%d "
+                "evict_wait_calls=%d evict_wait_ms=%d evict_wait_timeouts=%d",
                 st["primary_hit"],
                 st["primary_inflight"],
                 st["sec_lookup"],
                 st["sec_hit"],
                 st["promo_ok"],
                 st["promo_fail"],
+                st["promo_refused_blocks"],
                 st["miss"],
                 st["store_failures"],
                 st["evict_cascaded"],
                 st["evict_lost"],
+                st["evict_wait_calls"],
+                st["evict_wait_ms"],
+                st["evict_wait_timeouts"],
             )
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
@@ -527,23 +581,25 @@ class TieringOffloadingManager(OffloadingManager):
         # Must happen immediately so primary.lookup() returns None (in-flight)
         # for this key on any subsequent lookup() call within the same step,
         # preventing duplicate promotion attempts.
-        if self.secondary_tiers and self.primary_tier.free_slots() <= 0:
-            # Every slot is cached or held by an in-flight eviction copy. A
-            # store attempt would evict a victim that cannot be reused until its
-            # own copy lands, i.e. it would churn the pool without making room.
-            # Report a miss; a later step retries once a copy finishes.
-            return False
+        #
+        # A full pool is not a refusal: prepare_write evicts the LRU victim and
+        # waits (bounded) for the copy that persists it, so the promoted block
+        # gets the slot its victim just gave back. Refusing here whenever
+        # free_slots() == 0 threw away every filesystem hit the moment the pool
+        # was full, which for a small state pool is always.
         primary_write_result = self.primary_tier.prepare_write([key], req_context)
 
         if primary_write_result is None:
-            # Primary tier is full; caller should treat the block as unavailable
-            # rather than retrying indefinitely.
+            # Every slot is pinned by a transfer or by a copy that missed the
+            # budget: caller treats the block as unavailable for now.
+            self._stats["promo_refused_blocks"] += 1
             return False
 
         if not primary_write_result.keys_to_store:
-            # The pool reported no refusal but had no room to allocate (its
-            # slots are held by in-flight eviction copies), so no destination
-            # block exists yet. Treat it as a miss and let a later step retry.
+            # The pool reported no refusal but had no room to allocate, so no
+            # destination block exists yet. Treat it as a miss and let a later
+            # step retry.
+            self._stats["promo_refused_blocks"] += 1
             return False
 
         store_spec = primary_write_result.store_spec
@@ -628,6 +684,10 @@ class TieringOffloadingManager(OffloadingManager):
     def pool_stats(self) -> tuple[int, int, int, int, int, int]:
         """Slot accounting of the primary pool, delegated to the tier that owns it."""
         return self.primary_tier.pool_stats()
+
+    def contains(self, key: OffloadKey) -> bool:
+        """Read-only membership probe of the primary pool (diagnostics only)."""
+        return self.primary_tier.contains(key)
 
     def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
         """
