@@ -158,6 +158,14 @@ class GGUFConfig(QuantizationConfig):
             self.unquantized_modules = hf_to_vllm_mapper.apply_list(
                 self.unquantized_modules
             )
+        # Per-layer tables are keyed by module prefix too, so a model that wraps
+        # its backbone (`model.layers.*` -> `language_model.model.layers.*`)
+        # must remap them as well; otherwise the GDN row layout silently misses
+        # and correct bytes land in the wrong rows.
+        if self.fallback_reasons:
+            self.fallback_reasons = hf_to_vllm_mapper.apply_dict(self.fallback_reasons)
+        if self.linear_layouts:
+            self.linear_layouts = hf_to_vllm_mapper.apply_dict(self.linear_layouts)
 
 
 def is_layer_skipped_gguf(

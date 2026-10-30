@@ -182,11 +182,18 @@ class Qwen3_5Config(PretrainedConfig):
             self.vision_config = self.sub_configs["vision_config"](**vision_config)
         elif vision_config is None:
             self.vision_config = self.sub_configs["vision_config"]()
+        else:
+            # A ready-made sub-config (e.g. built by the GGUF config adapter or
+            # by the vision-tower metadata) is used as is; dropping it here
+            # would silently fall back to the defaults.
+            self.vision_config = vision_config
 
         if isinstance(text_config, dict):
             self.text_config = self.sub_configs["text_config"](**text_config)
         elif text_config is None:
             self.text_config = self.sub_configs["text_config"]()
+        else:
+            self.text_config = text_config
 
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
