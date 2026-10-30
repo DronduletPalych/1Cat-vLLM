@@ -10,7 +10,7 @@ the Apache-2.0 Qwen3.5/plugin adapter; no llama.cpp implementation is copied.
 import gguf
 import torch
 
-from .qwen35 import _LAYERS, Qwen35Adapter
+from .qwen35 import _LAYERS
 from .qwen35_moe import _EXPERTS, Qwen35MoeAdapter
 
 _HC = {
@@ -74,11 +74,10 @@ class Qwen4ExpAdapter(Qwen35MoeAdapter):
             )
         return result
 
-    @staticmethod
-    def is_linear(name):
+    def is_linear(self, name):
         # HC uses explicitly unquantized replicated/merged linears.
         return (
-            Qwen35Adapter.is_linear(name)
+            super().is_linear(name)
             and "hyper_connection" not in name
             and not name.endswith("ngram_embedding.weight")
             and not name.endswith(
