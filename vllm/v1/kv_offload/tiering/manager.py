@@ -248,6 +248,10 @@ class TieringOffloadingManager(OffloadingManager):
         """Install a per-group callback that reports which tier served a hit."""
         self._hit_sink = sink
 
+    def secondary_lookup_stats(self) -> tuple[int, int]:
+        """Cumulative (secondary lookups, secondary hits) for this group."""
+        return self._stats["sec_lookup"], self._stats["sec_hit"]
+
     def _report_store_outcome(self, confirmed: int, lost: int) -> None:
         if self._store_outcome_sink is not None:
             self._store_outcome_sink(confirmed, lost)
@@ -469,10 +473,15 @@ class TieringOffloadingManager(OffloadingManager):
             )
 
     def _bump(self, name: str) -> None:
-        """Count a lookup outcome and log the running totals every 10 s."""
+        """Count a lookup outcome and log the running totals every 10 s.
+
+        The counters are kept even when the stats log is off: the grouped pool
+        reports the per-group secondary lookup/hit split in its own line, and
+        a silently idle FS tier must stay visible there.
+        """
+        self._stats[name] += 1
         if not _TIER_STATS:
             return
-        self._stats[name] += 1
         now = time.monotonic()
         if now - self._stats_last >= 10.0:
             self._stats_last = now
