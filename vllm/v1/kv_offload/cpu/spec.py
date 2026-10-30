@@ -291,7 +291,7 @@ class CPUOffloadingSpec(OffloadingSpec):
             max_tracker_size = int(self.extra_config.get("max_tracker_size", 64_000))
 
             def create_manager(
-                num_blocks: int, share_pages: bool
+                num_blocks: int, share_pages: bool, group_label: str = "-"
             ) -> CPUOffloadingManager:
                 return CPUOffloadingManager(
                     num_blocks=num_blocks,
@@ -300,12 +300,16 @@ class CPUOffloadingSpec(OffloadingSpec):
                     store_threshold=store_threshold,
                     max_tracker_size=max_tracker_size,
                     share_pages=share_pages,
+                    group_label=group_label,
+                    partial_admit=not share_pages,
                 )
 
             self._manager = (
                 GroupedCPUOffloadingManager(
                     {
-                        i: create_manager(num_blocks, share_pages=False)
+                        i: create_manager(
+                            num_blocks, share_pages=False, group_label=f"g{i}"
+                        )
                         for i, num_blocks in self.cpu_group_num_blocks.items()
                     }
                 )
