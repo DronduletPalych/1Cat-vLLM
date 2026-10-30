@@ -812,6 +812,17 @@ class GroupedCPUOffloadingManager(OffloadingManager):
         #   ref     — store batches the group refused
         self._stats: dict[int, list[int]] = {}
         self._stats_last = time.monotonic()
+        # Boundary state offers the scheduler read from its requests before the
+        # pool saw anything: [pre, not_ready, busy, retrycap].
+        #   pre       — offers the scheduler tried to place in this interval
+        #   not_ready — held back: the block's attention half is not
+        #               materialised yet (state alone is never written)
+        #   busy      — held back: the request's transfer or this pool was busy
+        #   retrycap  — dropped before the pool: queue cap or an unstorable
+        #               boundary
+        # Without them a boundary that never reaches the pool is invisible: the
+        # per-group `in` counter only sees what was offered to prepare_store.
+        self._boundary_stats: list[int] = [0, 0, 0, 0]
         # Per group: [ram_hit_lookups, fs_hit_lookups]. Hits answered by the
         # primary pool and hits answered by a secondary tier are counted apart:
         # an aggregate external-hit number hides a tier that does nothing.
@@ -879,6 +890,29 @@ class GroupedCPUOffloadingManager(OffloadingManager):
         self._stats.setdefault(group_idx, [0] * 9)[slot] += value
         self._maybe_log_stats()
 
+    def note_boundary_attempt(
+        self, pre: int = 0, not_ready: int = 0, busy: int = 0, retrycap: int = 0
+    ) -> None:
+        """Add the scheduler's boundary-state counters to this interval's log."""
+        if not self._stats_enabled:
+            return
+        acc = self._boundary_stats
+        acc[0] += pre
+        acc[1] += not_ready
+        acc[2] += busy
+        acc[3] += retrycap
+        self._maybe_log_stats()
+
+    def _secondary_lookup_row(self) -> dict[int, tuple[int, int]]:
+        """Per-group (secondary lookups, secondary hits), cumulative."""
+        row: dict[int, tuple[int, int]] = {}
+        for group_idx, manager in self.managers.items():
+            stats = getattr(manager, "secondary_lookup_stats", None)
+            if stats is None:
+                continue
+            row[group_idx] = stats()
+        return row
+
     def _maybe_log_stats(self, force: bool = False) -> None:
         if not self._stats_enabled:
             return
@@ -886,10 +920,18 @@ class GroupedCPUOffloadingManager(OffloadingManager):
         if not force and now - self._stats_last < 10.0:
             return
         self._stats_last = now
+        boundary = self._boundary_stats
         logger.info(
-            "GROUPED-STORE in_new_adm_def_out_lost_refused_casc_ref=%s",
+            "GROUPED-STORE in_new_adm_def_out_lost_refused_casc_ref=%s "
+            "pre_skip_pre_notready_busy_retrycap=%s sec_lk_sec_hit=%s",
             {g: tuple(v) for g, v in sorted(self._stats.items())},
+            tuple(boundary),
+            self._secondary_lookup_row(),
         )
+        # The counters are per interval: the pool reports what the scheduler
+        # offered and held back since the previous line.
+        for idx in range(len(boundary)):
+            boundary[idx] = 0
         # (pool, allocated, ready, pinned, not_ready, held) per group:
         # distinguishes a pool that is full of in-flight transfers from one that
         # is full of live cache entries, is held by an eviction copy, or shows

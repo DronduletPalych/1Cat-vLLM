@@ -384,18 +384,25 @@ def test_state_cap_evicts_the_oldest_checkpoint_as_a_whole_bundle(
     assert snap["fs_checkpoints"] == 2
 
 
-def test_state_cap_ignores_read_recency(state_cap, tmp_path):
+def test_state_cap_drops_a_never_read_checkpoint_first(state_cap, tmp_path):
     first = _commit_checkpoint(state_cap, tmp_path, 0)
-    _commit_checkpoint(state_cap, tmp_path, 1)
-    # Reading the oldest checkpoint must not protect it: the cap is FIFO by
-    # commit time, and a stale checkpoint that happens to be read is still the
-    # one to drop.
+    second = _commit_checkpoint(state_cap, tmp_path, 1)
+    # A chain hit reads the checkpoint it restores. That block is the one the
+    # session needs again, so the cap must drop a checkpoint nobody ever read
+    # instead of the oldest one.
     for group in _GROUPS:
         state_cap.touch(first[group])
 
-    _commit_checkpoint(state_cap, tmp_path, 2)
+    third = _commit_checkpoint(state_cap, tmp_path, 2)
 
-    assert not os.path.exists(first[0])
+    assert all(os.path.exists(path) for path in first.values())
+    assert not os.path.exists(second[0])
+    assert all(os.path.exists(path) for path in third.values())
+    snap = state_cap.snapshot()
+    assert snap["fs_state_evictions_total"] == 1
+    assert snap["fs_state_evict_read_total"] == 0
+    assert snap["fs_state_evict_unread_total"] == 1
+
 
 
 def test_attention_bytes_are_not_counted_as_state(tmp_path):

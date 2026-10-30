@@ -427,10 +427,23 @@ class OffloadingConnectorScheduler:
         # protected by their ref_cnt) and for sliding window blocks (which can
         # be freed before a request finishes).
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
-        # (req_id, boundary_tokens) -> pairing attempts. A boundary state is
-        # held back until every attention group has its block for that
-        # boundary, so the pair is always stored together.
-        self._boundary_pair_retries: dict[tuple[str, int], int] = {}
+        # Boundary-state diagnostic counters, published to the primary pool so
+        # GROUPED-STORE can show how many offers never reach it:
+        #   pre       — boundary offers read from the requests this step
+        #   not_ready — held back: the attention half (or the state key) of the
+        #               block is not materialised yet
+        #   busy      — held back: the request's transfer or the pool was busy
+        #   retrycap  — dropped before the pool: queue cap or a boundary the
+        #               offload grid can never address
+        self._boundary_pre = 0
+        self._boundary_skips: dict[str, int] = {
+            "not_ready": 0,
+            "busy": 0,
+            "retrycap": 0,
+        }
+        # A held-back hand-off pins the request's source block, so the queue of
+        # held offers is bounded per request: keep the newest, drop the oldest.
+        self._max_pending_boundary_offloads = 8
 
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
@@ -728,8 +741,14 @@ class OffloadingConnectorScheduler:
                   (between scheduler steps).
         """
         req_status = self._req_status[request.request_id]
-        for group_state in req_status.group_states:
-            group_state.block_ids.clear()
+        # Reset the positional block-ID view only when nothing still refers to
+        # it. The list is indexed by absolute offloaded-block position further
+        # down the step, so clearing it while a transfer or a held-back
+        # boundary offer is outstanding would make a materialised block look
+        # past the end of the list and drop the boundary state for good.
+        if not req_status.transfer_jobs and not req_status.pending_boundary_offloads:
+            for group_state in req_status.group_states:
+                group_state.block_ids.clear()
 
         req_status.update_offload_keys()
         req_status.num_locally_computed_tokens = num_computed_tokens
@@ -898,6 +917,46 @@ class OffloadingConnectorScheduler:
         if self._blocks_being_loaded is not None:
             self._blocks_being_loaded.update(keys_to_load)
 
+    def _sync_block_id_groups(self, scheduler_output: SchedulerOutput) -> None:
+        """Register this step's allocated GPU block IDs for every request.
+
+        ``block_ids`` is indexed by the request's ABSOLUTE offloaded-block
+        position (``_add_boundary_attention_keys``, ``_build_store_jobs``), so
+        it has to follow the allocation of every step, including the steps
+        whose store is skipped. Registering it inside the store path, behind
+        the "transfer in flight" guard, made the list trail the allocation:
+        the attention half of a Mamba boundary block was materialised, yet its
+        position was past the end of the list, so the boundary looked
+        ``not_ready`` and was retried (and eventually dropped) although nothing
+        was missing.
+        """
+        for req_id, new_block_id_groups, preempted in yield_req_data(scheduler_output):
+            req_status = self._req_status.get(req_id)
+            if req_status is None:
+                continue
+            if preempted:
+                # Preemption returns the blocks to the pool and the core
+                # re-sends the full list when the request is scheduled again.
+                for group_state in req_status.group_states:
+                    group_state.block_ids.clear()
+            if not new_block_id_groups:
+                continue
+            req_status.update_block_id_groups(new_block_id_groups)
+            # Fence the blocks the request just received against in-flight
+            # stores of a finished request: the pool may reuse those IDs.
+            if self._block_id_to_pending_jobs:
+                new_blocks_flat = [
+                    bid for new_blocks in new_block_id_groups for bid in new_blocks
+                ]
+                if not self._block_id_to_pending_jobs.keys().isdisjoint(
+                    new_blocks_flat
+                ):
+                    self._current_batch_jobs_to_flush.update(
+                        jid
+                        for bid in new_blocks_flat
+                        for jid in self._block_id_to_pending_jobs.get(bid, ())
+                    )
+
     def _build_store_jobs(
         self,
         scheduler_output: SchedulerOutput,
@@ -919,26 +978,10 @@ class OffloadingConnectorScheduler:
                     self._defer_stats["deferred_stores"] += 1
                     continue
 
-            if preempted:
-                for group_state in req_status.group_states:
-                    group_state.block_ids.clear()
-
-            if new_block_id_groups:
-                req_status.update_block_id_groups(new_block_id_groups)
-                # Fence new blocks against in-flight stores.
-                if self._block_id_to_pending_jobs:
-                    new_blocks_flat = [
-                        bid for new_blocks in new_block_id_groups for bid in new_blocks
-                    ]
-                    if not self._block_id_to_pending_jobs.keys().isdisjoint(
-                        new_blocks_flat
-                    ):
-                        self._current_batch_jobs_to_flush.update(
-                            jid
-                            for bid in new_blocks_flat
-                            for jid in self._block_id_to_pending_jobs.get(bid, ())
-                        )
-
+            # Block IDs and the preemption reset are registered by
+            # _sync_block_id_groups() before any store path runs: re-applying
+            # them here would either drop the step's fresh block IDs (a
+            # resumed request) or duplicate them.
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
             num_tokens_after_batch = req.num_computed_tokens + num_scheduled_tokens
             # with async scheduling, some tokens may be missing
@@ -1325,6 +1368,12 @@ class OffloadingConnectorScheduler:
         pending on the request and are retried on later steps: the normal
         store path retries by not advancing ``next_stored_block_idx``, while a
         hand-off is offered by the core only once.
+
+        A state is only stored together with the attention KV of the same
+        block. A block whose attention half is not materialised yet is held
+        back rather than written alone: the prefix-cache hit length is the
+        minimum over groups, so a state without its attention half can never
+        be restored and only costs FS capacity.
         """
         self._queue_boundary_state_offloads(scheduler_output)
 
@@ -1334,6 +1383,7 @@ class OffloadingConnectorScheduler:
             pending = req_status.pending_boundary_offloads
             if not pending:
                 continue
+            self._boundary_pre += len(pending)
             req_status.update_offload_keys()
             req = req_status.req
 
@@ -1341,6 +1391,7 @@ class OffloadingConnectorScheduler:
             if req_status.transfer_jobs:
                 any_jid = next(iter(req_status.transfer_jobs))
                 if not self._jobs[any_jid].is_store:
+                    self._boundary_skips["busy"] += len(pending)
                     self._defer_stats["deferred_stores"] += 1
                     continue
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
@@ -1362,12 +1413,14 @@ class OffloadingConnectorScheduler:
             for entry in pending:
                 group_idx, block_id, boundary_tokens = entry
                 group_config = self._group_config_by_idx[group_idx]
-                # Neither the offload cap nor the block alignment changes
-                # later: these offers can never be stored.
+                # A boundary off the offload grid, or past the token cap of
+                # this request, can never be stored: drop it, but count it so
+                # the loss is not silent.
                 if (
                     boundary_tokens > num_offloadable_tokens
                     or boundary_tokens % group_config.offloaded_block_size != 0
                 ):
+                    self._boundary_skips["retrycap"] += 1
                     continue
                 by_boundary.setdefault(boundary_tokens, []).append(entry)
 
@@ -1414,23 +1467,14 @@ class OffloadingConnectorScheduler:
                     keys, key_info, req_status, boundary_tokens
                 )
                 if not_ready:
-                    pair_key = (req_id, boundary_tokens)
-                    tries = self._boundary_pair_retries.get(pair_key, 0) + 1
-                    self._boundary_pair_retries[pair_key] = tries
-                    if tries <= 8:
-                        still_pending.extend(entries)
-                        continue
-                    logger.warning(
-                        "Request %s: storing boundary %d without attention "
-                        "groups %s after %d attempts",
-                        req_id,
-                        boundary_tokens,
-                        not_ready,
-                        tries,
-                    )
-                self._boundary_pair_retries.pop(
-                    (req_id, boundary_tokens), None
-                )
+                    # The block's attention half is not materialised yet. Hold
+                    # the state back and offer it again: writing the state
+                    # alone would make it unusable (the hit length is the
+                    # minimum over groups) while still consuming FS state
+                    # capacity, and dropping it loses the prefix for good.
+                    self._boundary_skips["not_ready"] += 1
+                    still_pending.extend(entries)
+                    continue
                 if not keys:
                     continue
                 store_output = self.manager.prepare_store(
@@ -1443,6 +1487,7 @@ class OffloadingConnectorScheduler:
                         req_id,
                         boundary_tokens,
                     )
+                    self._boundary_skips["busy"] += 1
                     still_pending.extend(entries)
                     continue
                 keys_to_store = set(store_output.keys_to_store)
@@ -1450,6 +1495,7 @@ class OffloadingConnectorScheduler:
                     if store_output.deferred_keys:
                         # Nothing placed, keys still queued for a slot: keep the
                         # hand-off pending or it is never offered again.
+                        self._boundary_skips["busy"] += 1
                         still_pending.extend(entries)
                         continue
                     # Every key is already in the tier (an identical prefix was
@@ -1460,6 +1506,7 @@ class OffloadingConnectorScheduler:
                     # Keep the offer pending so a later step can finish the
                     # groups that were refused; storing the attention half
                     # without its state (or the reverse) never yields a hit.
+                    self._boundary_skips["busy"] += 1
                     still_pending.extend(entries)
 
                 ordered_keys = [k for k in keys if k in keys_to_store]
@@ -1492,9 +1539,49 @@ class OffloadingConnectorScheduler:
                     req_id=req_id,
                     transfer_spec=(src_spec, store_output.store_spec),
                 )
+            if len(still_pending) > self._max_pending_boundary_offloads:
+                # Bounded queue: a held offer pins the request's source block,
+                # so keep the newest and count the ones given up.
+                surplus = len(still_pending) - self._max_pending_boundary_offloads
+                dropped = still_pending[:surplus]
+                still_pending = still_pending[surplus:]
+                self._boundary_skips["retrycap"] += len(dropped)
+                logger.warning(
+                    "Request %s: dropping %d held Mamba boundary state(s) at %s "
+                    "tokens, queue cap is %d",
+                    req_id,
+                    len(dropped),
+                    [entry[2] for entry in dropped],
+                    self._max_pending_boundary_offloads,
+                )
             req_status.pending_boundary_offloads = still_pending
 
         return store_jobs
+
+    def _publish_boundary_stats(self) -> None:
+        """Hand the boundary-store counters to the pool that logs them.
+
+        The state cap and the boundary path live in this process, next to the
+        primary pool, so the counters are pushed here instead of being kept in
+        two places. Counters are per interval, like the pool's own stats.
+        """
+        skips = self._boundary_skips
+        if not (self._boundary_pre or any(skips.values())):
+            return
+        sink = getattr(self.manager, "note_boundary_attempt", None)
+        if sink is None:
+            # No grouped pool to publish to (the counters stay here and the
+            # periodic OFFLOAD-DEFER line reports them).
+            return
+        sink(
+            pre=self._boundary_pre,
+            not_ready=skips["not_ready"],
+            busy=skips["busy"],
+            retrycap=skips["retrycap"],
+        )
+        self._boundary_pre = 0
+        for name in skips:
+            skips[name] = 0
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -1520,8 +1607,14 @@ class OffloadingConnectorScheduler:
         ):
             self._current_batch_jobs_to_flush.update(self._jobs.keys())
 
+        # Register this step's block IDs first: the boundary path indexes the
+        # positional list, and a list that trails the allocation is the reason
+        # a materialised attention block looked missing.
+        self._sync_block_id_groups(scheduler_output)
+
         boundary_store_jobs = self._build_boundary_state_store_jobs(scheduler_output)
         normal_store_jobs = self._build_store_jobs(scheduler_output)
+        self._publish_boundary_stats()
         meta = OffloadingConnectorMetadata(
             load_jobs=self._current_batch_load_jobs,
             store_jobs=boundary_store_jobs | normal_store_jobs,
@@ -1655,13 +1748,18 @@ class OffloadingConnectorScheduler:
             logger.info(
                 "OFFLOAD-DEFER deferred_stores=%d deferred_promotions=%d "
                 "store_cannot_proceed=%d store_deferred=%d pinned_blocks=%d "
-                "inflight_jobs=%d",
+                "inflight_jobs=%d boundary_pre=%d boundary_skip_not_ready=%d "
+                "boundary_skip_busy=%d boundary_skip_retrycap=%d",
                 st["deferred_stores"],
                 st["deferred_promotions"],
                 st["store_cannot_proceed"],
                 st["store_deferred"],
                 pinned,
                 len(self._jobs),
+                self._boundary_pre,
+                self._boundary_skips["not_ready"],
+                self._boundary_skips["busy"],
+                self._boundary_skips["retrycap"],
             )
             self._log_hit_split()
         for event in self.manager.take_events():
