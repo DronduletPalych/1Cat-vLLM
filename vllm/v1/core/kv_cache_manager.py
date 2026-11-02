@@ -409,7 +409,13 @@ class KVCacheManager:
             self._block_copies.append((source.block_id, target.block_id))
             sources.append(source)
         # Keep the reference taken by the cache hit until the copy has run.
+        # The sources are the entry's last blocks; the entry still references
+        # them, so touch them to keep their ref above the entry's own count.
+        # Without this, the deferred release below drops the last block to
+        # ref 0 and frees it while the entry (and any future partial hit on
+        # it) still points at that exact block object.
         if sources:
+            self.block_pool.touch(sources)
             self._defer_release(sources)
 
     def _materialize_snapshots(self) -> None:
@@ -448,6 +454,12 @@ class KVCacheManager:
                 )
                 for source, target in zip(group_sources, group_targets):
                     self._block_copies.append((source.block_id, target.block_id))
+                    # Stamp the source's hash onto the copy so that, once the
+                    # entry is released, its blocks are offloaded to RAM/FS on
+                    # par with the main cache: the offload connector selects
+                    # free blocks by block_hash. Same data, same group id.
+                    if source.block_hash is not None:
+                        target.block_hash = source.block_hash
                 targets.append(group_targets)
             flat = [block for blocks in sources for block in blocks]
             # The request may release these blocks this step.

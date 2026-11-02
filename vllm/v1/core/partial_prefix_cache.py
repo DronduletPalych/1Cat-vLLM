@@ -52,6 +52,10 @@ class PartialEntry:
     copy_last: list[bool]
     # Scheduler step whose worker pass fills ``blocks``; usable after it.
     ready_step: int
+    # Set once the entry's blocks are published to the main prefix-cache map
+    # (see ``PartialPrefixCache._publish_to_main_cache``), so they can be
+    # offloaded to RAM/FS on par with ordinary cached blocks.
+    in_main_cache: bool = False
 
     @property
     def num_blocks(self) -> int:
@@ -129,7 +133,28 @@ class PartialPrefixCache:
                 best = entry
         if best is not None:
             self.entries.move_to_end(best.key)
+            self._publish_to_main_cache(best)
         return best
+
+    def _publish_to_main_cache(self, entry: PartialEntry) -> None:
+        """Publish an entry's blocks to the main prefix-cache map, once.
+
+        Called from ``lookup`` only for a ready entry, i.e. after the worker
+        pass has filled the blocks. Publishing them makes the blocks behave
+        exactly like ordinary cached blocks: the offload connector selects
+        free blocks by ``block_hash`` (so a released entry is offloaded to
+        RAM/FS instead of dropped), and reallocation evicts them from the
+        map, which clears the hash and avoids a stale key.
+        """
+        if entry.in_main_cache:
+            return
+        for blocks in entry.blocks:
+            for block in blocks:
+                if block.block_hash is not None:
+                    self.block_pool.cached_block_hash_to_block.insert(
+                        block.block_hash, block
+                    )
+        entry.in_main_cache = True
 
     def clear(self) -> None:
         while self.evict_one():
