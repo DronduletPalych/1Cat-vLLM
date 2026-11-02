@@ -644,9 +644,6 @@ class EngineArgs:
 
     scheduler_reserve_full_isl: bool = SchedulerConfig.scheduler_reserve_full_isl
     watermark: float = SchedulerConfig.watermark
-    watermark_output_reserve_tokens: int = (
-        SchedulerConfig.watermark_output_reserve_tokens
-    )
 
     disable_hybrid_kv_cache_manager: bool | None = (
         SchedulerConfig.disable_hybrid_kv_cache_manager
@@ -2333,7 +2330,6 @@ class EngineArgs:
             ),
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             watermark=self.watermark,
-            watermark_output_reserve_tokens=self.watermark_output_reserve_tokens,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
