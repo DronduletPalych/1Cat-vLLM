@@ -249,6 +249,161 @@ def test_request_preemption(request_runner, async_scheduling: bool):
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
+def test_preemption_with_inflight_load(request_runner, async_scheduling: bool):
+    """Preempting a request with a LOAD in flight must flush the load job
+    (its dst blocks are freed back to the pool), not trip the store-only
+    assert in build_connector_meta."""
+    block_size = 4
+    block_size_factor = 3
+    offloaded_block_size = block_size * block_size_factor
+    num_gpu_blocks = 100
+
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=num_gpu_blocks,
+        async_scheduling=async_scheduling,
+        block_size_factor=block_size_factor,
+    )
+    handler = runner.offloading_spec.handler
+
+    free_block_queue = runner.scheduler.kv_cache_manager.block_pool.free_block_queue
+    num_free_blocks_empty = free_block_queue.num_free_blocks
+
+    # store 3 offloaded blocks (9 GPU blocks)
+    runner.new_request(token_ids=[0] * offloaded_block_size * 3)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=(0, 1, 2, 3, 4, 5, 6, 7, 8),
+    )
+
+    # start a request that loads the whole prefix; keep its load job
+    # in flight across steps
+    runner.scheduler.reset_prefix_cache()
+    runner.new_request(token_ids=[0] * offloaded_block_size * 3)
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 3
+    handler.defer_new_jobs = True
+    runner.run(
+        decoded_tokens=[],
+        complete_transfers=False,
+    )
+
+    # the request has a single load job in flight
+    load_jobs = [
+        status
+        for status in runner.connector_scheduler._jobs.values()
+        if not status.is_store
+    ]
+    assert len(load_jobs) == 1
+
+    # simulate KV cache running out of space
+    free_block_queue.num_free_blocks = 0
+
+    # request should be preempted now; the in-flight load is flushed
+    # together with the freed blocks (pre-fix this tripped the
+    # store-only assert in build_connector_meta)
+    runner.run(
+        decoded_tokens=[],
+        complete_transfers=False,
+        expected_flushed=(0, 1, 2, 3, 4, 5, 6, 7, 8),
+    )
+
+    # the flushed load is still tracked: the worker finished it on
+    # flush, and the completion path finalizes the bookkeeping once
+    # the completion is reported
+    assert len(runner.connector_scheduler._jobs) == 1
+
+    # report the flushed load's completion; with no free blocks the
+    # request is not re-admitted, so this run only pumps the
+    # completion through update_connector_output
+    handler.defer_new_jobs = False
+    handler.release()
+    runner.run(
+        decoded_tokens=[],
+        complete_transfers=False,
+    )
+
+    # the load job is gone and the request's job set is cleared
+    assert not runner.connector_scheduler._jobs
+    req_id = str(runner.req_id)
+    assert runner.connector_scheduler._req_status[req_id].transfer_jobs == set()
+
+    # restore KV cache space and reset GPU prefix cache
+    free_block_queue.num_free_blocks = num_free_blocks_empty
+    runner.scheduler.reset_prefix_cache()
+
+    # request should now return from preemption and re-load [0, ..., 8]
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 3
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(
+        decoded_tokens=[0] * block_size,
+        expected_loaded=(0, 1, 2, 3, 4, 5, 6, 7, 8),
+    )
+
+
+def test_reset_cache_clears_inflight_job_bookkeeping(request_runner):
+    """reset_cache clears per-request transfer_jobs of the discarded jobs,
+    so surviving requests don't keep stale job IDs that would KeyError the
+    in-flight guards."""
+    block_size = 4
+    block_size_factor = 3
+    offloaded_block_size = block_size * block_size_factor
+    num_gpu_blocks = 100
+
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=num_gpu_blocks,
+        async_scheduling=False,
+        block_size_factor=block_size_factor,
+    )
+    handler = runner.offloading_spec.handler
+
+    # store 1 offloaded block (3 GPU blocks)
+    runner.new_request(token_ids=[0] * offloaded_block_size)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=(0, 1, 2),
+        expected_flushed=(0, 1, 2),
+    )
+
+    # start a request that loads the stored block; keep the load in flight
+    runner.scheduler.reset_prefix_cache()
+    runner.new_request(token_ids=[0] * offloaded_block_size)
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 1
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+    handler.defer_new_jobs = True
+    runner.run(decoded_tokens=[], complete_transfers=False)
+
+    # a load job is in flight
+    assert any(
+        not status.is_store for status in runner.connector_scheduler._jobs.values()
+    )
+
+    runner.connector_scheduler.reset_cache()
+
+    # every surviving request must reference no jobs anymore
+    for status in runner.connector_scheduler._req_status.values():
+        assert status.transfer_jobs == set()
+    assert not runner.connector_scheduler._jobs
+
+    # the completion arrives after the reset: it must be skipped as
+    # stale, not crash
+    handler.defer_new_jobs = False
+    handler.release()
+    runner.run(decoded_tokens=[], complete_transfers=False)
+    assert not runner.connector_scheduler._jobs
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
 def test_concurrent_lookups_of_the_same_prefix(request_runner, async_scheduling: bool):
     block_size = 4
     block_size_factor = 3
