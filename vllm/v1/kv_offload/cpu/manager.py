@@ -27,6 +27,11 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+# Reason string for a refusal that only keeps an ordinary admission out of the
+# slot reserved for a boundary store. It is matched by the refusal bookkeeping,
+# so it lives in one place.
+RESERVE_REFUSAL_REASON = "state slot reserved for boundary store"
+
 # A cascade handler receives the blocks the replacement policy just evicted and
 # returns the keys whose slot it now owns: their data is copied elsewhere before
 # the slot may be reused. Every other victim's slot is freed immediately.
@@ -68,6 +73,7 @@ class CPUOffloadingManager(OffloadingManager):
         defer_inflight_lookup: bool = False,
         group_label: str = "-",
         partial_admit: bool = False,
+        reserve_slots: int = 0,
     ):
         self.medium: str = CPULoadStoreSpec.medium()
         self._num_blocks: int = num_blocks
@@ -107,6 +113,16 @@ class CPUOffloadingManager(OffloadingManager):
         # retry the tail keeps blocks flowing to the secondary tiers; a shared
         # page pool keeps the all-or-nothing contract.
         self.partial_admit: bool = partial_admit
+        # Slots an ordinary admission must leave alone. A grouped state pool is
+        # also the staging buffer for FS->CPU promotions, so a burst of
+        # promotions (or of plain stores) can take every slot and leave a
+        # boundary-state offer with `free=0 evictable=0` -- a refusal the pool
+        # can never resolve, because nothing in it is evictable. Reserving one
+        # slot for the boundary path keeps that offer admissible; only pools
+        # with a boundary path (Mamba groups) set it. The reserve is not a
+        # capacity change: total slots are unchanged, it only decides who may
+        # take the last one.
+        self.reserve_slots: int = 0 if share_pages else max(0, int(reserve_slots))
         self._admit_last_log: float = 0.0
         # Slots whose data is being copied out of the pool before reuse (see
         # set_eviction_cascade). They are out of the policy and out of the free
@@ -126,10 +142,24 @@ class CPUOffloadingManager(OffloadingManager):
         self._reclaim_waits: int = 0
         self._reclaim_wait_ms: int = 0
         self._reclaim_timeouts: int = 0
-        # Blocks the pool could not place at all. `blocks`/`lost` count every
-        # refused key (an offer that produced no slot and no copy), so a refusal
-        # is visible in the loss accounting instead of hiding behind lost=0.
-        self._refusals: dict[str, int] = {"batches": 0, "blocks": 0, "lost": 0}
+        # Blocks the pool could not place at all. `batches`/`blocks` count every
+        # refused offer, `refused` the same keys again, and `lost` only the keys
+        # given up for good (see note_lost). A refusal returned to the caller is
+        # retried by it -- the boundary path keeps the offer pending -- so it is
+        # a deferral, not a loss; counting it as lost inflated the loss figure.
+        self._refusals: dict[str, int] = {
+            "batches": 0,
+            "blocks": 0,
+            "refused": 0,
+            # Refusals that happen only because the batch would eat into the
+            # boundary reserve. They are the reserve working, not a pool out of
+            # slots, so they are kept apart: folding them into `blocks` made
+            # refused_blocks non-zero from ordinary behaviour, i.e. the refusal
+            # counter no longer measured the defect it was added for.
+            "batches_reserve": 0,
+            "refused_reserve": 0,
+            "lost": 0,
+        }
 
     # --- eviction cascade ---
 
@@ -244,6 +274,49 @@ class CPUOffloadingManager(OffloadingManager):
     def _get_num_free_blocks(self) -> int:
         return len(self._free_list) + self._num_blocks - self._num_allocated_blocks
 
+    def _reserve_keep(self, priority: bool) -> int:
+        """Slots this admission may not touch (0 for the boundary path)."""
+        return 0 if priority else self.reserve_slots
+
+    def _usable_free(self, priority: bool) -> int:
+        """Free slots an admission may take, reserve excluded.
+
+        The reserve is what makes a boundary-state offer admissible while a
+        promotion burst holds the rest of the pool: ordinary admissions stop at
+        ``free - reserve_slots``, the boundary path (``priority``) may use the
+        reserved slot as well.
+        """
+        free = self._get_num_free_blocks()
+        return max(0, free - self._reserve_keep(priority))
+
+    def has_room(self, keys: Collection[OffloadKey], priority: bool = False) -> bool:
+        """Whether every key can be placed, counting the slots eviction frees.
+
+        Admission is per key and a batch is placed key by key, so a batch that
+        does not fit is placed in part. A boundary store is a pair (state +
+        attention of the same block) and a half pair is unreadable, so the
+        caller asks first and skips the whole pair instead of writing part of
+        it. The answer includes the evictable slots, because the placement
+        itself is allowed to evict; what it excludes is the reserve, which an
+        ordinary admission must leave behind.
+        """
+        need = sum(1 for key in keys if self._policy.get(key) is None)
+        if need <= 0:
+            return True
+        keep = self._reserve_keep(priority)
+        free = self._get_num_free_blocks()
+        if need + keep <= free:
+            return True
+        if free == 0 and self._held_block_ids:
+            # Mirrors the refusal at the top of the admission path: with no
+            # reusable slot and copies that own the pinned ones still in flight,
+            # the pool refuses instead of churning one more victim. Counting
+            # only evictable slots here promised room the admission would not
+            # give, and the caller placed half the pair on that promise.
+            return False
+        evictable, _, _ = self._admit_composition(set(keys))
+        return need + keep <= free + evictable
+
     def _admit_composition(self, protected: set[OffloadKey]) -> tuple[int, int, int]:
         """Count cached blocks by why they cannot be evicted (diagnostics only).
 
@@ -272,12 +345,21 @@ class CPUOffloadingManager(OffloadingManager):
     ) -> None:
         """Record a store batch the pool cannot fully admit, with its composition."""
         unserved = max(0, new - admitted)
-        self._refusals["batches"] += 1
-        self._refusals["blocks"] += unserved
-        # A key without a host slot never reaches a secondary tier, so a refused
-        # key is a lost block unless the caller manages to offer it again. It is
-        # counted here, once per offer, instead of vanishing into lost=0.
-        self._refusals["lost"] += unserved
+        # A refusal caused by the reserve is the reserve doing its job, not a
+        # pool that ran out of slots: it is counted separately so `refused` and
+        # `refused_blocks` keep meaning "the pool had nowhere to put this".
+        if reason == RESERVE_REFUSAL_REASON:
+            self._refusals["batches_reserve"] += 1
+            self._refusals["refused_reserve"] += unserved
+        else:
+            self._refusals["batches"] += 1
+            self._refusals["blocks"] += unserved
+            # A refusal is returned to the caller, and both callers retry: the
+            # scheduler keeps a refused boundary offer pending and leaves a
+            # refused store batch below its cursor. So this is a deferral --
+            # counted in `refused`, reported through deferred_unresolved -- and
+            # only a key the caller gives up for good is a loss (note_lost).
+            self._refusals["refused"] += unserved
         now = time.monotonic()
         if now - self._admit_last_log < 2.0:
             return
@@ -286,8 +368,9 @@ class CPUOffloadingManager(OffloadingManager):
         logger.info(
             "FS-ADMIT-REFUSE grp=%s reason=%s new=%d admitted=%d unserved=%d free=%d "
             "pool=%d alloc=%d need_evict=%d evictable=%d pinned=%d not_ready=%d "
-            "protected=%d held=%d refusals=%d refused_blocks=%d waits=%d "
-            "wait_ms=%d wait_timeouts=%d",
+            "protected=%d held=%d reserve=%d refusals=%d refused_blocks=%d "
+            "lost_blocks=%d reserve_refusals=%d reserve_refused_blocks=%d "
+            "waits=%d wait_ms=%d wait_timeouts=%d",
             self.group_label,
             reason,
             new,
@@ -302,12 +385,25 @@ class CPUOffloadingManager(OffloadingManager):
             not_ready,
             len(protected),
             len(self._held_block_ids),
+            self.reserve_slots,
             self._refusals["batches"],
             self._refusals["blocks"],
+            self._refusals["lost"],
+            self._refusals["batches_reserve"],
+            self._refusals["refused_reserve"],
             self._reclaim_waits,
             self._reclaim_wait_ms,
             self._reclaim_timeouts,
         )
+
+    def note_lost(self, count: int) -> None:
+        """Count keys the caller gave up on for good (never offered again).
+
+        Only this path raises `lost`: a refusal that the caller retries is a
+        deferral, and a store the secondary tier confirms is an `out`.
+        """
+        if count > 0:
+            self._refusals["lost"] += int(count)
 
     def reclaim_stats(self) -> tuple[int, int, int]:
         """Bounded eviction-copy waits so far: (calls, total_ms, timeouts)."""
@@ -434,12 +530,16 @@ class CPUOffloadingManager(OffloadingManager):
         self,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
+        priority: bool = False,
+        atomic: bool = False,
     ) -> PrepareStoreOutput | None:
         if self.counts is not None:
             keys = [k for k in keys if self.counts.get(k, 0) >= self.store_threshold]
 
         if not self.share_pages:
-            return self._prepare_store_per_key(keys, req_context)
+            return self._prepare_store_per_key(
+                keys, req_context, priority=priority, atomic=atomic
+            )
 
         # A CPU page holds every KV group of one token block. Group the keys by
         # block hash so all groups of a block share one page and one block id.
@@ -565,8 +665,29 @@ class CPUOffloadingManager(OffloadingManager):
             cascaded_keys=tuple(cascaded),
         )
 
+    def _refusal_reason(self, want: int, priority: bool) -> str:
+        """Name what blocked an admission, for the refusal log.
+
+        A refusal that happens only because the batch would eat into the
+        boundary reserve is reported as such: it is the intended behaviour of
+        the reserve, not a pool that is genuinely out of slots.
+        """
+        free = self._get_num_free_blocks()
+        if (
+            not priority
+            and self.reserve_slots > 0
+            and free >= want
+            and free - want < self.reserve_slots
+        ):
+            return RESERVE_REFUSAL_REASON
+        return "per-key pool full"
+
     def _prepare_store_per_key(
-        self, keys: Collection[OffloadKey], req_context: ReqContext
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+        priority: bool = False,
+        atomic: bool = False,
     ) -> PrepareStoreOutput | None:
         # Grouped pools give every key its own slot: block ids address disjoint
         # per-group tensors, so keys must never be merged by block hash.
@@ -579,27 +700,48 @@ class CPUOffloadingManager(OffloadingManager):
                 evicted_keys=[],
             )
 
+        # An ordinary admission may not take the last reserved slot; the
+        # boundary path may. `atomic` additionally forbids placing a batch in
+        # part: a boundary store is a state+attention pair, and half a pair is
+        # unreadable on disk (capacity.py:97), so the caller gets the whole
+        # bundle or a refusal it retries.
+        partial = self.partial_admit and not atomic
+
         # A slot this pool evicted is not free until the copy that persists it
         # lands. Collect those slots first: a copy already in flight returns its
         # slot without evicting anything, and each new offer that evicts one more
         # victim for the same admission only churns the pool.
-        free = self._get_num_free_blocks()
-        if len(keys_to_store) > free and self._held_block_ids:
-            self._reclaim_held(len(keys_to_store) - free)
-            free = self._get_num_free_blocks()
+        keep = self._reserve_keep(priority)
+        if keep and len(keys_to_store) + keep > self._num_blocks:
+            # A batch that cannot fit next to the reserve would be refused for
+            # ever: this path never spends the reserve, so `want < need` holds
+            # on every retry and its cursor would stop for good. The batch is the
+            # larger claim here, so the reserve yields. Production state groups
+            # get one key per boundary, so this only guards a multi-key group.
+            keep = max(0, self._num_blocks - len(keys_to_store))
+        usable = self._usable_free(priority)
+        if len(keys_to_store) > usable and self._held_block_ids:
+            self._reclaim_held(len(keys_to_store) + keep - self._get_num_free_blocks())
+            usable = self._usable_free(priority)
 
         deferred: tuple[OffloadKey, ...] = ()
         to_evict: list[OffloadKey] = []
         cascaded: list[OffloadKey] = []
-        need = len(keys_to_store) - free
+        # Slots to free: the keys themselves plus the reserve the admission must
+        # leave behind. Subtracting the reserve from `free` instead would evict
+        # a victim and then find the freed slot reserved, i.e. churn the pool
+        # without admitting anything.
+        need = len(keys_to_store) + keep - self._get_num_free_blocks()
         if need > 0:
             protected = set(keys)
             evictable, _, _ = self._admit_composition(protected)
-            if free == 0 and self._held_block_ids:
+            reason = self._refusal_reason(len(keys_to_store), priority)
+            if self._get_num_free_blocks() == 0 and self._held_block_ids:
                 # No reusable slot anywhere and the copies that own the pinned
                 # ones did not land inside the budget. Evicting one more victim
                 # would pin a second slot for this same admission, so report the
-                # refusal (counted as lost) instead of churning the pool.
+                # refusal instead of churning the pool. The caller retries it, so
+                # it is a deferral, not a loss.
                 self._log_admit_refusal(
                     len(keys_to_store),
                     need,
@@ -609,23 +751,27 @@ class CPUOffloadingManager(OffloadingManager):
                 )
                 return None
             want = min(need, evictable)
-            if want < need and not self.partial_admit:
+            if want < need and (not partial or keep > 0):
+                # Either the placement must be all-or-nothing, or this pool
+                # holds a reserve: evicting fewer victims than needed would take
+                # the reserve and still leave the batch unplaced.
                 self._log_admit_refusal(
                     len(keys_to_store),
                     need,
                     protected,
-                    "per-key pool full",
+                    reason,
                     0,
                 )
                 return None
-            if want <= 0 and free == 0:
-                # Nothing evictable and no free slot: a refusal is the only
-                # answer, and it is counted as a lost block.
+            if want <= 0 and usable == 0:
+                # Nothing free and nothing evictable: every slot is cached,
+                # pinned by a transfer, or in flight. A refusal is the only
+                # answer and the caller retries it.
                 self._log_admit_refusal(
                     len(keys_to_store),
                     need,
                     protected,
-                    "per-key pool full",
+                    reason,
                     0,
                 )
                 return None
@@ -644,28 +790,45 @@ class CPUOffloadingManager(OffloadingManager):
         # Slots held by the cascade are not free until their copy lands. Wait for
         # those copies instead of refusing: the block the caller wants to store
         # was accepted for exactly this reason.
-        free = self._get_num_free_blocks()
-        if free < len(keys_to_store) and self._held_block_ids:
-            self._reclaim_held(len(keys_to_store) - free)
-            free = self._get_num_free_blocks()
+        usable = self._usable_free(priority)
+        if usable < len(keys_to_store) and self._held_block_ids:
+            self._reclaim_held(
+                len(keys_to_store) + keep - self._get_num_free_blocks()
+            )
+            usable = self._usable_free(priority)
 
-        if free == 0 and keys_to_store:
-            # Every slot is cached, pinned by a transfer, or held by an eviction
-            # copy that missed the budget. Refuse the batch (and count it) instead
-            # of returning an empty store: the caller retries, while an empty
-            # keys_to_store would tell the scheduler there is nothing left to
-            # store and the blocks would never be offered again.
+        if atomic and usable < len(keys_to_store):
+            # Half a boundary bundle must not be written: the state of a block
+            # without its attention KV (or the reverse) can never be a hit and
+            # only costs capacity. Refuse the whole bundle; the caller keeps it
+            # pending and offers it again once a slot comes back.
             self._log_admit_refusal(
                 len(keys_to_store) + len(deferred),
                 len(keys_to_store),
                 set(keys),
-                "all slots held by eviction copies",
+                "boundary pair does not fit",
                 0,
             )
             return None
-        if free < len(keys_to_store):
-            deferred = tuple(keys_to_store[free:]) + deferred
-            keys_to_store = keys_to_store[:free]
+
+        if usable == 0 and keys_to_store:
+            # Every slot is cached, pinned by a transfer, held by an eviction
+            # copy that missed the budget, or kept back as the boundary reserve.
+            # Refuse the batch instead of returning an empty store: the caller
+            # retries, while an empty keys_to_store would tell the scheduler
+            # there is nothing left to store and the blocks would never be
+            # offered again.
+            self._log_admit_refusal(
+                len(keys_to_store) + len(deferred),
+                len(keys_to_store),
+                set(keys),
+                self._refusal_reason(len(keys_to_store), priority),
+                0,
+            )
+            return None
+        if usable < len(keys_to_store):
+            deferred = tuple(keys_to_store[usable:]) + deferred
+            keys_to_store = keys_to_store[:usable]
 
         if to_evict and self.events is not None:
             self.events.append(
@@ -781,6 +944,12 @@ class GroupedCPUOffloadingManager(OffloadingManager):
     repeat across groups; the GPU transfer spec carries the original group ID.
     """
 
+    # The scheduler may hand a boundary bundle to prepare_store() with
+    # priority=True / atomic=True: the state pools keep a slot for it and the
+    # bundle is admitted whole or not at all. Probed by the scheduler instead of
+    # a TypeError, so a plain (non-tiering) manager keeps working unchanged.
+    supports_priority_store: bool = True
+
     def __init__(
         self,
         managers: Mapping[int, OffloadingManager],
@@ -804,25 +973,29 @@ class GroupedCPUOffloadingManager(OffloadingManager):
         #   def     — blocks the pool deferred to the caller's next attempt
         #             (partial admit: no slot yet, retried, not lost)
         #   out     — admitted stores the secondary tier CONFIRMED as written
-        #   lost    — blocks that left the pool without ever being persisted,
-        #             including refused blocks (a refusal has no slot, so it can
-        #             never reach a secondary tier)
+        #   lost    — blocks that left the pool without ever being persisted and
+        #             were NOT offered again: a store the secondary tier dropped,
+        #             or a boundary offer the scheduler gave up on (note_lost_keys)
         #   refused — blocks in batches the group refused outright
         #   casc    — eviction victims the secondary tier confirmed as written
         #   ref     — store batches the group refused
         self._stats: dict[int, list[int]] = {}
         self._stats_last = time.monotonic()
         # Boundary state offers the scheduler read from its requests before the
-        # pool saw anything: [pre, not_ready, busy, retrycap].
+        # pool saw anything: [pre, not_ready, busy, retrycap, lost].
         #   pre       — offers the scheduler tried to place in this interval
         #   not_ready — held back: the block's attention half is not
         #               materialised yet (state alone is never written)
         #   busy      — held back: the request's transfer or this pool was busy
         #   retrycap  — dropped before the pool: queue cap or an unstorable
         #               boundary
+        #   lost      — dropped for good (also counted in the group's `lost`)
         # Without them a boundary that never reaches the pool is invisible: the
         # per-group `in` counter only sees what was offered to prepare_store.
-        self._boundary_stats: list[int] = [0, 0, 0, 0]
+        self._boundary_stats: list[int] = [0, 0, 0, 0, 0]
+        # Boundary offers deferred and not written as of the last interval, per
+        # group: the AC-3 gauge `deferred_unresolved`.
+        self._boundary_pending: dict[int, int] = {}
         # Per group: [ram_hit_lookups, fs_hit_lookups]. Hits answered by the
         # primary pool and hits answered by a secondary tier are counted apart:
         # an aggregate external-hit number hides a tier that does nothing.
@@ -891,9 +1064,25 @@ class GroupedCPUOffloadingManager(OffloadingManager):
         self._maybe_log_stats()
 
     def note_boundary_attempt(
-        self, pre: int = 0, not_ready: int = 0, busy: int = 0, retrycap: int = 0
+        self,
+        pre: int = 0,
+        not_ready: int = 0,
+        busy: int = 0,
+        retrycap: int = 0,
+        lost: int = 0,
+        pending: Mapping[int, int] | None = None,
+        lost_keys: Mapping[int, int] | None = None,
     ) -> None:
-        """Add the scheduler's boundary-state counters to this interval's log."""
+        """Add the scheduler's boundary-state counters to this interval's log.
+
+        `lost` counts boundary offers the scheduler gave up on for good (queue
+        cap, unstorable boundary, preemption): unlike a refusal, those keys are
+        never offered again. `pending` is the gauge AC-3 needs -- boundary
+        offers that are deferred and not written as of this interval, per group
+        (deferred_unresolved) -- so it is reported even when no counter moved.
+        `lost_keys` carries the same losses split by group: `lost` alone is one
+        sum and the per-group `lost` column stayed at zero without it.
+        """
         if not self._stats_enabled:
             return
         acc = self._boundary_stats
@@ -901,7 +1090,24 @@ class GroupedCPUOffloadingManager(OffloadingManager):
         acc[1] += not_ready
         acc[2] += busy
         acc[3] += retrycap
+        acc[4] += lost
+        if lost_keys:
+            self.note_lost_keys(lost_keys)
+        self._boundary_pending = dict(pending or {})
         self._maybe_log_stats()
+
+    def note_lost_keys(self, counts: Mapping[int, int]) -> None:
+        """Count boundary offers the scheduler dropped for good, per group."""
+        for group_idx, count in counts.items():
+            if count <= 0:
+                continue
+            # Column 5 is `lost`: the key was admitted nowhere and is not
+            # offered again, so this is the only path that raises it.
+            self._bump_group(int(group_idx), 5, int(count))
+            manager = self.managers.get(group_idx)
+            note = getattr(manager, "note_lost", None)
+            if note is not None:
+                note(int(count))
 
     def _secondary_lookup_row(self) -> dict[int, tuple[int, int]]:
         """Per-group (secondary lookups, secondary hits), cumulative."""
@@ -923,10 +1129,21 @@ class GroupedCPUOffloadingManager(OffloadingManager):
         boundary = self._boundary_stats
         logger.info(
             "GROUPED-STORE in_new_adm_def_out_lost_refused_casc_ref=%s "
-            "pre_skip_pre_notready_busy_retrycap=%s sec_lk_sec_hit=%s",
+            "pre_skip_pre_notready_busy_retrycap_lost=%s sec_lk_sec_hit=%s",
             {g: tuple(v) for g, v in sorted(self._stats.items())},
             tuple(boundary),
             self._secondary_lookup_row(),
+        )
+        # AC-3 gauge: boundary offers still deferred (held pending, written
+        # nowhere) at the end of the interval, per group. A number that does not
+        # come down is accumulation; a refusal that is never retried shows up in
+        # `lost` instead.
+        logger.info(
+            "GROUPED-BOUNDARY-DEFERRED deferred_unresolved=%s "
+            "deferred_unresolved_scope=boundary_offers reserve=%s",
+            {g: n for g, n in sorted(self._boundary_pending.items()) if n},
+            {g: m.reserve_slots for g, m in sorted(self.managers.items())
+             if getattr(m, "reserve_slots", 0)},
         )
         # The counters are per interval: the pool reports what the scheduler
         # offered and held back since the previous line.
@@ -944,19 +1161,29 @@ class GroupedCPUOffloadingManager(OffloadingManager):
             },
         )
         logger.info(
-            "FS-REFUSE group_ref_batches_ref_blocks_wait_calls_wait_ms_timeouts=%s",
+            "FS-REFUSE group_ref_batches_ref_blocks_lost_blocks_wait_calls_"
+            "wait_ms_timeouts=%s",
             {g: self._refuse_row(m) for g, m in sorted(self.managers.items())},
         )
 
     @staticmethod
     def _refuse_row(manager: OffloadingManager) -> tuple[int, ...]:
-        """(refused batches, refused blocks, reclaim waits, ms, timeouts)."""
+        """(refused batches, refused blocks, lost blocks, waits, ms, timeouts).
+
+        `refused_blocks` counts offers the pool could not place this interval;
+        `lost_blocks` only the keys the caller gave up on, so the two are read
+        apart instead of one standing in for the other.
+        """
         refusals = getattr(manager, "refusal_stats", None)
         reclaim = getattr(manager, "reclaim_stats", None)
         if refusals is None or reclaim is None:
-            return (0, 0, 0, 0, 0)
+            return (0, 0, 0, 0, 0, 0)
         stats = refusals()
-        return (stats["batches"], stats["blocks"]) + reclaim()
+        return (
+            stats["batches"],
+            stats["blocks"],
+            stats.get("lost", 0),
+        ) + reclaim()
 
     def _maybe_log_hits(self, force: bool = False) -> None:
         if not self._stats_enabled:
@@ -1030,16 +1257,38 @@ class GroupedCPUOffloadingManager(OffloadingManager):
             self.managers[group_idx].complete_load(group_keys, req_context)
 
     def prepare_store(
-        self, keys: Collection[OffloadKey], req_context: ReqContext
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+        priority: bool = False,
+        atomic: bool = False,
     ) -> PrepareStoreOutput | None:
         # No store gate: attention of a block below its Mamba checkpoint
         # boundary is still required to rebuild the prefix chain from block
         # zero. Dropping it made every tier lookup miss.
+        #
+        # `atomic` is the boundary-store contract: a Mamba boundary bundle is
+        # the state of a block plus the attention KV of the same block, all
+        # groups admitted or nothing written. A bundle placed in part writes a
+        # half pair that the hit-length minimum can never restore
+        # (capacity.py:97 "attention without state is unreadable and only wastes
+        # capacity"), so room is checked for every group before any group is
+        # touched. `priority` lets the bundle use the slot the state pools
+        # reserve for it.
+        if atomic:
+            for group_idx, group_keys in self._partition(keys).items():
+                manager = self.managers[group_idx]
+                room = getattr(manager, "has_room", None)
+                if room is None or not room(group_keys, priority=priority):
+                    self._bump_group(group_idx, 6, len(group_keys))
+                    self._bump_group(group_idx, 8, 1)
+                    return None
         block_ids: dict[OffloadKey, int] = {}
         evicted_keys: list[OffloadKey] = []
         cascaded_keys: list[OffloadKey] = []
         deferred_keys: list[OffloadKey] = []
         refused_groups: list[int] = []
+        accepted: list[tuple[int, PrepareStoreOutput]] = []
         for group_idx, group_keys in self._partition(keys).items():
             self._bump_group(group_idx, 0, len(group_keys))
             manager = self.managers[group_idx]
@@ -1051,22 +1300,39 @@ class GroupedCPUOffloadingManager(OffloadingManager):
                 1,
                 sum(0 if manager.contains(key) else 1 for key in group_keys),
             )
-            output = manager.prepare_store(group_keys, req_context)
+            output = manager.prepare_store(
+                group_keys, req_context, priority=priority, atomic=atomic
+            )
             if output is None:
-                # This pool cannot take any of its keys right now. Keep the
-                # other groups' admissions instead of cancelling the batch: a
-                # block that never gets a host slot never reaches a secondary
-                # tier either, so one starved group must not drop the blocks
-                # that do fit. The caller retries the refused keys.
                 refused_groups.append(group_idx)
                 self._bump_group(group_idx, 8, 1)
-                # A refused key has no slot and no copy, so it is a block at
-                # risk of never being persisted: count it, or the channel stays
-                # invisible behind lost=0.
+                # A refused key has no slot yet, but the caller is handed the
+                # keys back and offers them again (the boundary path keeps them
+                # pending, the store path keeps its cursor below them), so this
+                # is a deferral, not a loss. `lost` is reserved for keys the
+                # caller gives up on for good.
                 self._bump_group(group_idx, 6, len(group_keys))
-                self._bump_group(group_idx, 5, len(group_keys))
+                if atomic:
+                    # The pair is admitted whole or not at all: give back the
+                    # slots the earlier groups already took. Without this the
+                    # bundle is written in part, and the half that lands is
+                    # unreadable on disk (capacity.py:97) -- exactly the defect
+                    # the atomic pre-check was added for.
+                    for done_idx, done in accepted:
+                        self.managers[done_idx].complete_store(
+                            done.keys_to_store, req_context, success=False
+                        )
+                        self._bump_group(done_idx, 2, -len(done.keys_to_store))
+                        self._bump_group(done_idx, 3, -len(done.deferred_keys))
+                    accepted.clear()
+                    return None
+                # Not a boundary bundle: keep the other groups' admissions
+                # instead of cancelling the batch. A block that never gets a
+                # host slot never reaches a secondary tier either, so one
+                # starved group must not drop the blocks that do fit.
                 deferred_keys.extend(group_keys)
                 continue
+            accepted.append((group_idx, output))
             assert isinstance(output.store_spec, CPULoadStoreSpec)
             self._bump_group(group_idx, 2, len(output.keys_to_store))
             self._bump_group(group_idx, 3, len(output.deferred_keys))
