@@ -1628,11 +1628,15 @@ class OffloadingConnectorScheduler:
             # Preemption returns the request's blocks to the pool, so
             # boundary states not yet handed to a store job are gone.
             self._drop_pending_boundary_offloads(req_status, "preempted")
-            if not req_status.transfer_jobs:
-                continue
-            any_jid = next(iter(req_status.transfer_jobs))
-            assert self._jobs[any_jid].is_store
-            self._current_batch_jobs_to_flush.update(req_status.transfer_jobs)
+            # Flush every in-flight job, loads included: preemption frees
+            # the blocks the transfers copy to/from, so the worker must
+            # finish them before those blocks are re-used. The worker
+            # completes the flushed jobs before the forward pass
+            # (handle_preemptions waits on jobs_to_flush), and the
+            # completion path in update_connector_output finalizes all
+            # bookkeeping, so the job sets are left untouched here.
+            if req_status.transfer_jobs:
+                self._current_batch_jobs_to_flush.update(req_status.transfer_jobs)
 
         # If all tracked requests are finished, flush all pending jobs
         # (both store and load) - there might not be a future scheduler
@@ -1865,6 +1869,10 @@ class OffloadingConnectorScheduler:
         self._stale_job_threshold = self._job_counter
         self._jobs.clear()
         self._block_id_to_pending_jobs.clear()
+        # The per-request job sets still reference the discarded job IDs;
+        # without clearing them, the in-flight guards would raise KeyError.
+        for status in self._req_status.values():
+            status.transfer_jobs.clear()
 
         # Note: _current_batch_jobs_to_flush is intentionally NOT cleared.
         # The load flush IDs collected above must be delivered to workers.

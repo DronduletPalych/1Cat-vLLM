@@ -24,6 +24,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
 )
 from vllm.forward_context import ForwardContext
+from vllm.platforms import current_platform
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import (
     get_request_block_hasher,
@@ -82,6 +83,11 @@ class MockOffloadingHandler(OffloadingHandler):
         self.waiting_jobs: set[int] = set()
         self.completed_jobs: list[int] = []
         self.flushed_jobs: set[int] = set()
+        # Jobs kept in flight: wait()/complete_jobs() leave them
+        # pending until release() is called.
+        self.deferred_jobs: set[int] = set()
+        # Automatically defer jobs submitted via transfer_async().
+        self.defer_new_jobs: bool = False
 
     def get_finished(self) -> list[TransferResult]:
         finished = self.completed_transfers
@@ -91,10 +97,12 @@ class MockOffloadingHandler(OffloadingHandler):
     def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
         self.transfer_specs[job_id] = spec
         self.waiting_jobs.add(job_id)
+        if self.defer_new_jobs:
+            self.deferred_jobs.add(job_id)
         return True
 
     def complete_jobs(self, job_ids: set[int]) -> None:
-        for job_id in job_ids:
+        for job_id in job_ids - self.deferred_jobs:
             if job_id in self.waiting_jobs:
                 self.waiting_jobs.remove(job_id)
                 self.completed_jobs.append(job_id)
@@ -109,6 +117,13 @@ class MockOffloadingHandler(OffloadingHandler):
 
     def wait(self, job_ids: set[int]) -> None:
         self.flushed_jobs |= job_ids
+        self.complete_jobs(job_ids)
+
+    def release(self, job_ids: set[int] | None = None) -> None:
+        """Complete previously deferred jobs (default: all of them)."""
+        if job_ids is None:
+            job_ids = set(self.deferred_jobs)
+        self.deferred_jobs -= job_ids
         self.complete_jobs(job_ids)
 
 
@@ -185,10 +200,15 @@ class RequestRunner:
 
         self.req_id: int = -1
 
+        # HMA is explicitly enabled where the platform supports it (GPU CI).
+        # On CPU platforms HMA is unsupported, so let vLLM auto-disable it
+        # (explicit enable raises in VllmConfig validation).
         vllm_config = create_vllm_config(
             block_size=block_size,
             max_num_batched_tokens=1000,
-            disable_hybrid_kv_cache_manager=False,
+            disable_hybrid_kv_cache_manager=(
+                False if current_platform.support_hybrid_kv_cache() else None
+            ),
         )
         vllm_config.scheduler_config.async_scheduling = async_scheduling
 
