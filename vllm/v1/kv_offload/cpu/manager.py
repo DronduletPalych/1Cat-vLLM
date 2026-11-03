@@ -1319,8 +1319,12 @@ class GroupedCPUOffloadingManager(OffloadingManager):
                     # unreadable on disk (capacity.py:97) -- exactly the defect
                     # the atomic pre-check was added for.
                     for done_idx, done in accepted:
-                        self.managers[done_idx].complete_store(
-                            done.keys_to_store, req_context, success=False
+                        # Release, do not complete: the caller retries the whole
+                        # bundle, so these keys were never written and counting
+                        # them as failed stores would report a loss that did not
+                        # happen.
+                        self.managers[done_idx].discard_store(
+                            done.keys_to_store, req_context
                         )
                         self._bump_group(done_idx, 2, -len(done.keys_to_store))
                         self._bump_group(done_idx, 3, -len(done.deferred_keys))
@@ -1364,6 +1368,20 @@ class GroupedCPUOffloadingManager(OffloadingManager):
     ) -> None:
         for group_idx, group_keys in self._partition(keys).items():
             self.managers[group_idx].complete_store(group_keys, req_context, success)
+
+    def discard_store(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> None:
+        """Hand back the slots of a bundle store that is not being issued.
+
+        Called for the part of a boundary pair the tier did admit when the rest
+        could not be placed: the offer stays pending and is retried, so these
+        keys were never written and must not be counted as lost.
+        """
+        for group_idx, group_keys in self._partition(keys).items():
+            self.managers[group_idx].discard_store(group_keys, req_context)
 
     def take_events(self) -> Iterable[OffloadingEvent]:
         for manager in self.managers.values():
