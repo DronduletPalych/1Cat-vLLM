@@ -254,6 +254,26 @@ class OffloadingManager(ABC):
         """
         return
 
+    def discard_store(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> None:
+        """
+        Releases blocks that were prepared for a store which will not be issued.
+
+        The caller keeps the offer pending and retries it on a later step, so
+        nothing was written and this is not a loss: the slots simply have to be
+        reusable again. A plain pool treats it as a failed store, which frees
+        the blocks; the tiered manager overrides it so the secondary tiers and
+        the loss counters are not involved.
+
+        Args:
+            keys: the keys which were admitted but will not be stored now.
+            req_context: per-request context (e.g. kv_transfer_params).
+        """
+        self.complete_store(keys, req_context, success=False)
+
     @abstractmethod
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         """

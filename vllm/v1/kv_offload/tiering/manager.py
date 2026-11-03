@@ -260,6 +260,19 @@ class TieringOffloadingManager(OffloadingManager):
         """Cumulative (secondary lookups, secondary hits) for this group."""
         return self._stats["sec_lookup"], self._stats["sec_hit"]
 
+    def discard_store(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> None:
+        """Release slots taken for a store that will not be issued.
+
+        The keys sit in the primary pool not-ready with no transfer job behind
+        them. Freeing them is not a loss: the caller keeps the offer pending and
+        retries it, and nothing reached a secondary tier.
+        """
+        self.primary_tier.complete_store(keys, req_context, success=False)
+
     def _report_store_outcome(self, confirmed: int, lost: int) -> None:
         if self._store_outcome_sink is not None:
             self._store_outcome_sink(confirmed, lost)
