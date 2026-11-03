@@ -451,6 +451,7 @@ class OffloadingConnectorScheduler:
             "busy": 0,
             "retrycap": 0,
             "superseded": 0,
+            "beyond_policy": 0,
         }
         # Boundary offers dropped for good, per group: the queue cap evicted
         # them, the offer can never be addressed, or the request ended with the
@@ -1464,16 +1465,18 @@ class OffloadingConnectorScheduler:
             for entry in pending:
                 group_idx, block_id, boundary_tokens = entry
                 group_config = self._group_config_by_idx[group_idx]
-                # A boundary off the offload grid, or past the token cap of
-                # this request, can never be stored: drop it, but count it so
-                # the loss is not silent.
+                # Past the offload policy of this request (prompt-only, or the
+                # token cap the request asked for) or off the tier's block grid:
+                # the offer can never be stored, so it is dropped. It never
+                # reached the tier, though, so it is a policy exclusion and not
+                # a lost block -- `lost` is kept for data the tier accepted and
+                # then dropped.
                 if (
                     boundary_tokens > num_offloadable_tokens
                     or boundary_tokens % group_config.offloaded_block_size != 0
                 ):
                     self._boundary_skips["retrycap"] += 1
-                    # Never storable: the offer is given up, not deferred.
-                    self._note_boundary_lost([entry])
+                    self._boundary_skips["beyond_policy"] += 1
                     continue
                 by_boundary.setdefault(boundary_tokens, []).append(entry)
 
@@ -1668,6 +1671,7 @@ class OffloadingConnectorScheduler:
             busy=skips["busy"],
             retrycap=skips["retrycap"],
             superseded=skips["superseded"],
+            beyond_policy=skips["beyond_policy"],
             lost=sum(lost.values()),
             pending=pending,
             # Per-group split: the sum alone cannot fill the per-group `lost`
