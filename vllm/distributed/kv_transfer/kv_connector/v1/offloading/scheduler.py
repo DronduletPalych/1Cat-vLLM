@@ -32,6 +32,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingSpec,
     OffloadKey,
     OffloadPolicy,
+    PrepareStoreOutput,
     ReqContext,
     RequestOffloadingContext,
     get_offload_block_hash,
@@ -449,7 +450,13 @@ class OffloadingConnectorScheduler:
             "not_ready": 0,
             "busy": 0,
             "retrycap": 0,
+            "superseded": 0,
+            "beyond_policy": 0,
         }
+        # Boundary offers dropped for good, per group: the queue cap evicted
+        # them, the offer can never be addressed, or the request ended with the
+        # offer still pending. Only these raise the pool's `lost`.
+        self._boundary_lost: dict[int, int] = {}
         # A held-back hand-off pins the request's source block, so the queue of
         # held offers is bounded per request: keep the newest, drop the oldest.
         self._max_pending_boundary_offloads = 8
@@ -1292,6 +1299,15 @@ class OffloadingConnectorScheduler:
                 ]
                 pending.append((group_idx, block_id, boundary_tokens))
 
+    def _note_boundary_lost(self, entries: Iterable[tuple[int, int, int]]) -> None:
+        """Count boundary offers given up for good, per group.
+
+        A refusal is retried and therefore only deferred; an offer dropped here
+        is never offered again, so it is the one case that is a loss.
+        """
+        for group_idx, _block_id, _boundary_tokens in entries:
+            self._boundary_lost[group_idx] = self._boundary_lost.get(group_idx, 0) + 1
+
     def _drop_pending_boundary_offloads(
         self, req_status: RequestOffloadState, reason: str
     ) -> None:
@@ -1306,6 +1322,7 @@ class OffloadingConnectorScheduler:
             [entry[2] for entry in pending],
             reason,
         )
+        self._note_boundary_lost(pending)
         pending.clear()
 
     def _add_boundary_attention_keys(
@@ -1448,14 +1465,18 @@ class OffloadingConnectorScheduler:
             for entry in pending:
                 group_idx, block_id, boundary_tokens = entry
                 group_config = self._group_config_by_idx[group_idx]
-                # A boundary off the offload grid, or past the token cap of
-                # this request, can never be stored: drop it, but count it so
-                # the loss is not silent.
+                # Past the offload policy of this request (prompt-only, or the
+                # token cap the request asked for) or off the tier's block grid:
+                # the offer can never be stored, so it is dropped. It never
+                # reached the tier, though, so it is a policy exclusion and not
+                # a lost block -- `lost` is kept for data the tier accepted and
+                # then dropped.
                 if (
                     boundary_tokens > num_offloadable_tokens
                     or boundary_tokens % group_config.offloaded_block_size != 0
                 ):
                     self._boundary_skips["retrycap"] += 1
+                    self._boundary_skips["beyond_policy"] += 1
                     continue
                 by_boundary.setdefault(boundary_tokens, []).append(entry)
 
@@ -1512,9 +1533,12 @@ class OffloadingConnectorScheduler:
                     continue
                 if not keys:
                     continue
-                store_output = self.manager.prepare_store(
-                    keys, req_status.req_context
-                )
+                # The bundle is a pair per group: the state of the block plus
+                # its attention KV. Hand it to the pool as one atomic, priority
+                # offer -- priority so the state pool's reserve is available to
+                # it, atomic so it is admitted whole or not at all (a half pair
+                # is unreadable on disk and only costs capacity).
+                store_output = self._prepare_boundary_store(keys, req_status)
                 if store_output is None:
                     logger.debug(
                         "Request %s: host tier busy, retrying Mamba boundary "
@@ -1526,23 +1550,24 @@ class OffloadingConnectorScheduler:
                     still_pending.extend(entries)
                     continue
                 keys_to_store = set(store_output.keys_to_store)
+                if store_output.deferred_keys:
+                    # Part of the pair could not be placed this step. Keep the
+                    # whole offer pending: storing the attention half without
+                    # its state (or the reverse) never yields a hit. The keys
+                    # the tier did take were placed under this offer, so their
+                    # slots are given back -- nothing was written for them, and
+                    # the offer is retried, so this is not a loss.
+                    self._boundary_skips["busy"] += 1
+                    still_pending.extend(entries)
+                    if keys_to_store:
+                        self.manager.discard_store(
+                            keys_to_store, req_status.req_context
+                        )
+                    continue
                 if not keys_to_store:
-                    if store_output.deferred_keys:
-                        # Nothing placed, keys still queued for a slot: keep the
-                        # hand-off pending or it is never offered again.
-                        self._boundary_skips["busy"] += 1
-                        still_pending.extend(entries)
-                        continue
                     # Every key is already in the tier (an identical prefix was
                     # stored before). Nothing to transfer and nothing to retry.
                     continue
-                if len(keys_to_store) < len(keys):
-                    # The host tier admitted only part of the boundary bundle.
-                    # Keep the offer pending so a later step can finish the
-                    # groups that were refused; storing the attention half
-                    # without its state (or the reverse) never yields a hit.
-                    self._boundary_skips["busy"] += 1
-                    still_pending.extend(entries)
 
                 ordered_keys = [k for k in keys if k in keys_to_store]
                 group_sizes = [0] * num_groups
@@ -1576,14 +1601,21 @@ class OffloadingConnectorScheduler:
                 )
             if len(still_pending) > self._max_pending_boundary_offloads:
                 # Bounded queue: a held offer pins the request's source block,
-                # so keep the newest and count the ones given up.
+                # so the queue keeps the newest boundaries of the request and
+                # gives up the oldest. The dropped offers are superseded, not
+                # lost: a retained offer of the same request covers a longer
+                # prefix, and the retention policy keeps only the tail
+                # boundaries anyway (_KEEP_TAIL_STATE_BLOCKS). They are counted
+                # apart so `lost` keeps meaning "the tier took it and the data
+                # went away".
                 surplus = len(still_pending) - self._max_pending_boundary_offloads
                 dropped = still_pending[:surplus]
                 still_pending = still_pending[surplus:]
                 self._boundary_skips["retrycap"] += len(dropped)
+                self._boundary_skips["superseded"] += len(dropped)
                 logger.warning(
-                    "Request %s: dropping %d held Mamba boundary state(s) at %s "
-                    "tokens, queue cap is %d",
+                    "Request %s: %d held Mamba boundary state(s) at %s tokens "
+                    "superseded by newer boundaries, queue cap is %d",
                     req_id,
                     len(dropped),
                     [entry[2] for entry in dropped],
@@ -1593,30 +1625,64 @@ class OffloadingConnectorScheduler:
 
         return store_jobs
 
+    def _prepare_boundary_store(
+        self, keys: Sequence[OffloadKey], req_status: RequestOffloadState
+    ) -> PrepareStoreOutput | None:
+        """Offer one boundary bundle to the host tier as an atomic pair.
+
+        A manager that knows about the boundary reserve (the grouped CPU
+        manager) takes `priority`/`atomic`; any other manager is called with the
+        plain signature and keeps its previous behaviour.
+        """
+        req_context = req_status.req_context
+        if getattr(self.manager, "supports_priority_store", False):
+            return self.manager.prepare_store(
+                keys, req_context, priority=True, atomic=True
+            )
+        return self.manager.prepare_store(keys, req_context)
+
     def _publish_boundary_stats(self) -> None:
         """Hand the boundary-store counters to the pool that logs them.
 
         The state cap and the boundary path live in this process, next to the
         primary pool, so the counters are pushed here instead of being kept in
         two places. Counters are per interval, like the pool's own stats.
+        `deferred_unresolved` is a gauge, not a delta: it is the number of
+        boundary offers held pending (neither written nor dropped) right now, so
+        it is published every step even when no counter moved.
         """
         skips = self._boundary_skips
-        if not (self._boundary_pre or any(skips.values())):
-            return
         sink = getattr(self.manager, "note_boundary_attempt", None)
         if sink is None:
             # No grouped pool to publish to (the counters stay here and the
             # periodic OFFLOAD-DEFER line reports them).
+            return
+        pending: dict[int, int] = {}
+        for req_status in self._req_status.values():
+            for group_idx, _block_id, _tokens in req_status.pending_boundary_offloads:
+                pending[group_idx] = pending.get(group_idx, 0) + 1
+        lost = self._boundary_lost
+        if not (self._boundary_pre or any(skips.values()) or lost or pending):
+            sink(pending=pending)
             return
         sink(
             pre=self._boundary_pre,
             not_ready=skips["not_ready"],
             busy=skips["busy"],
             retrycap=skips["retrycap"],
+            superseded=skips["superseded"],
+            beyond_policy=skips["beyond_policy"],
+            lost=sum(lost.values()),
+            pending=pending,
+            # Per-group split: the sum alone cannot fill the per-group `lost`
+            # column, so a loss stayed invisible per group and AC-3 checked zero
+            # against a counter that was never written.
+            lost_keys=dict(lost),
         )
         self._boundary_pre = 0
         for name in skips:
             skips[name] = 0
+        lost.clear()
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput

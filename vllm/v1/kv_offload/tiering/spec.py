@@ -167,6 +167,18 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     # offload anything.
                     partial_admit=True,
                     group_label=str(group),
+                    # Measured on the production host (caco, 21:43-22:02 window):
+                    # the Mamba state pool holds 15 slots and in steady state has
+                    # exactly one free slot, so keeping a reserve means
+                    # `free - reserve == 0` and EVERY ordinary store/promotion is
+                    # refused -- reserve_refusals 5910 per group against 49
+                    # admitted, promo_fail 6004 against promo_ok 1549. Meanwhile
+                    # the boundary path was never refused in that window
+                    # (pre_skip_pre_notready_busy_retrycap_lost all zero), so the
+                    # reserve protected nothing and starved the promotion stream.
+                    # The mechanism is kept (priority/atomic), the reservation is
+                    # off: a normal write may take the free slot.
+                    reserve_slots=0,
                 )
                 cleanup.callback(primary.shutdown)
                 tiers = []
