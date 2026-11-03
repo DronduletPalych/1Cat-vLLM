@@ -992,7 +992,7 @@ class GroupedCPUOffloadingManager(OffloadingManager):
         #   lost      — dropped for good (also counted in the group's `lost`)
         # Without them a boundary that never reaches the pool is invisible: the
         # per-group `in` counter only sees what was offered to prepare_store.
-        self._boundary_stats: list[int] = [0, 0, 0, 0, 0, 0]
+        self._boundary_stats: list[int] = [0, 0, 0, 0, 0, 0, 0]
         # Boundary offers deferred and not written as of the last interval, per
         # group: the AC-3 gauge `deferred_unresolved`.
         self._boundary_pending: dict[int, int] = {}
@@ -1070,6 +1070,7 @@ class GroupedCPUOffloadingManager(OffloadingManager):
         busy: int = 0,
         retrycap: int = 0,
         superseded: int = 0,
+        beyond_policy: int = 0,
         lost: int = 0,
         pending: Mapping[int, int] | None = None,
         lost_keys: Mapping[int, int] | None = None,
@@ -1081,7 +1082,9 @@ class GroupedCPUOffloadingManager(OffloadingManager):
         finished with the offer pending): unlike a refusal, those keys are never
         offered again. `superseded` counts offers dropped by the bounded queue in
         favour of a newer boundary of the same request: that is the retention
-        policy, not a loss, so it is kept out of `lost`. `pending` is the gauge AC-3 needs -- boundary
+        policy, not a loss, so it is kept out of `lost`. `beyond_policy` counts
+        offers the request's own offload policy excludes (prompt-only, token cap,
+        off the block grid): they never reach the pool at all. `pending` is the gauge AC-3 needs -- boundary
         offers that are deferred and not written as of this interval, per group
         (deferred_unresolved) -- so it is reported even when no counter moved.
         `lost_keys` carries the same losses split by group: `lost` alone is one
@@ -1096,6 +1099,7 @@ class GroupedCPUOffloadingManager(OffloadingManager):
         acc[3] += retrycap
         acc[4] += lost
         acc[5] += superseded
+        acc[6] += beyond_policy
         if lost_keys:
             self.note_lost_keys(lost_keys)
         self._boundary_pending = dict(pending or {})
@@ -1134,7 +1138,7 @@ class GroupedCPUOffloadingManager(OffloadingManager):
         boundary = self._boundary_stats
         logger.info(
             "GROUPED-STORE in_new_adm_def_out_lost_refused_casc_ref=%s "
-            "pre_skip_pre_notready_busy_retrycap_lost_superseded=%s "
+            "pre_skip_notready_busy_retrycap_superseded_beyond_policy_lost=%s "
             "sec_lk_sec_hit=%s",
             {g: tuple(v) for g, v in sorted(self._stats.items())},
             tuple(boundary),
