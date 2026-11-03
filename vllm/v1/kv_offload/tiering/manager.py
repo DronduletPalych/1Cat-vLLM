@@ -98,6 +98,7 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         enable_events: bool = False,
         partial_admit: bool = False,
         group_label: str = "-",
+        reserve_slots: int = 0,
     ):
         super().__init__(
             num_blocks=num_blocks,
@@ -108,6 +109,10 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
             defer_inflight_lookup=True,
             partial_admit=partial_admit,
             group_label=group_label,
+            # A state pool reserved for the boundary path: promotions write here
+            # too, and a promotion burst that takes the last slot is what made a
+            # boundary offer refuse with free=0 evictable=0.
+            reserve_slots=reserve_slots,
         )
         self._mmap_region = mmap_region
         # read/write is for CPU<->secondary transfers,
@@ -168,6 +173,9 @@ class TieringOffloadingManager(OffloadingManager):
         """
         self.primary_tier: CPUPrimaryTierOffloadingManager = primary_tier
         self.secondary_tiers = secondary_tiers or []
+        # Slots this tier's primary pool keeps for the boundary path; exposed so
+        # the grouped manager's interval log can show the reserve per group.
+        self.reserve_slots: int = int(getattr(primary_tier, "reserve_slots", 0))
 
         self._job_id_counter: int = 0
         self.events: list[OffloadingEvent] | None = [] if enable_events else None
@@ -523,10 +531,10 @@ class TieringOffloadingManager(OffloadingManager):
 
         Returns:
             True  — block is ready in the primary tier.
-            None  — block found but not yet ready (primary in-flight,
-                    promotion started, or a secondary tier is busy).
-            False — block not found in any tier, or primary is full
-                    and cannot accept a promotion.
+            None  — block found but not ready yet (primary in-flight,
+                    promotion started or deferred for a slot, or a secondary
+                    tier is busy).
+            False — block not found in any tier.
         """
         self._maybe_process_finished_jobs()
 
@@ -548,7 +556,13 @@ class TieringOffloadingManager(OffloadingManager):
                 self._bump("sec_hit")
                 if not self._initiate_promotion(tier, key, req_context):
                     self._bump("promo_fail")
-                    return False  # primary full, block unavailable
+                    # The block was found: the hit exists, only the slot to copy
+                    # it into is not free yet. Reporting False here told the
+                    # caller "not in any tier" (a miss) and the hit was dropped
+                    # on every step the pool happened to be full, which for the
+                    # state pools is most steps. Defer instead, so the request
+                    # retries this hit next step.
+                    return None
                 self._bump("promo_ok")
                 # Answered by the slower tier: this is the hit an aggregate
                 # external-hit counter hides when the FS tier is idle.
@@ -606,8 +620,8 @@ class TieringOffloadingManager(OffloadingManager):
 
         if not primary_write_result.keys_to_store:
             # The pool reported no refusal but had no room to allocate, so no
-            # destination block exists yet. Treat it as a miss and let a later
-            # step retry.
+            # destination block exists yet: the hit is deferred, not lost, and
+            # the caller retries it on a later step.
             self._stats["promo_refused_blocks"] += 1
             return False
 
@@ -698,6 +712,15 @@ class TieringOffloadingManager(OffloadingManager):
         """Read-only membership probe of the primary pool (diagnostics only)."""
         return self.primary_tier.contains(key)
 
+    def has_room(self, keys: Collection[OffloadKey], priority: bool = False) -> bool:
+        """Whether the primary pool can take every key without evicting.
+
+        Forwarded to the pool so the grouped manager can gate a boundary pair
+        before any group of it is admitted (see
+        GroupedCPUOffloadingManager.prepare_store).
+        """
+        return self.primary_tier.has_room(keys, priority=priority)
+
     def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
         """
         Mark blocks as done loading from primary tier to GPU.
@@ -712,7 +735,11 @@ class TieringOffloadingManager(OffloadingManager):
         self.primary_tier.complete_load(keys, req_context)
 
     def prepare_store(
-        self, keys: Collection[OffloadKey], req_context: ReqContext
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+        priority: bool = False,
+        atomic: bool = False,
     ) -> PrepareStoreOutput | None:
         """
         Prepare blocks to be stored from GPU to primary tier.
@@ -741,7 +768,9 @@ class TieringOffloadingManager(OffloadingManager):
         # Cascading of these newly-stored blocks to ALL secondary tiers
         # happens later in complete_store(), after the GPU→Primary transfer
         # completes.
-        primary_result = self.primary_tier.prepare_store(keys, req_context)
+        primary_result = self.primary_tier.prepare_store(
+            keys, req_context, priority=priority, atomic=atomic
+        )
 
         if primary_result is None:
             return None
