@@ -450,6 +450,7 @@ class OffloadingConnectorScheduler:
             "not_ready": 0,
             "busy": 0,
             "retrycap": 0,
+            "superseded": 0,
         }
         # Boundary offers dropped for good, per group: the queue cap evicted
         # them, the offer can never be addressed, or the request ended with the
@@ -1597,16 +1598,21 @@ class OffloadingConnectorScheduler:
                 )
             if len(still_pending) > self._max_pending_boundary_offloads:
                 # Bounded queue: a held offer pins the request's source block,
-                # so keep the newest and count the ones given up.
+                # so the queue keeps the newest boundaries of the request and
+                # gives up the oldest. The dropped offers are superseded, not
+                # lost: a retained offer of the same request covers a longer
+                # prefix, and the retention policy keeps only the tail
+                # boundaries anyway (_KEEP_TAIL_STATE_BLOCKS). They are counted
+                # apart so `lost` keeps meaning "the tier took it and the data
+                # went away".
                 surplus = len(still_pending) - self._max_pending_boundary_offloads
                 dropped = still_pending[:surplus]
                 still_pending = still_pending[surplus:]
                 self._boundary_skips["retrycap"] += len(dropped)
-                # Given up by the queue cap: never offered again, so a loss.
-                self._note_boundary_lost(dropped)
+                self._boundary_skips["superseded"] += len(dropped)
                 logger.warning(
-                    "Request %s: dropping %d held Mamba boundary state(s) at %s "
-                    "tokens, queue cap is %d",
+                    "Request %s: %d held Mamba boundary state(s) at %s tokens "
+                    "superseded by newer boundaries, queue cap is %d",
                     req_id,
                     len(dropped),
                     [entry[2] for entry in dropped],
@@ -1661,6 +1667,7 @@ class OffloadingConnectorScheduler:
             not_ready=skips["not_ready"],
             busy=skips["busy"],
             retrycap=skips["retrycap"],
+            superseded=skips["superseded"],
             lost=sum(lost.values()),
             pending=pending,
             # Per-group split: the sum alone cannot fill the per-group `lost`
