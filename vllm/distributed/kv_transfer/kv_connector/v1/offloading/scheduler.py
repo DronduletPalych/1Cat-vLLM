@@ -32,6 +32,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingSpec,
     OffloadKey,
     OffloadPolicy,
+    PrepareStoreOutput,
     ReqContext,
     RequestOffloadingContext,
     get_offload_block_hash,
@@ -450,6 +451,10 @@ class OffloadingConnectorScheduler:
             "busy": 0,
             "retrycap": 0,
         }
+        # Boundary offers dropped for good, per group: the queue cap evicted
+        # them, the offer can never be addressed, or the request ended with the
+        # offer still pending. Only these raise the pool's `lost`.
+        self._boundary_lost: dict[int, int] = {}
         # A held-back hand-off pins the request's source block, so the queue of
         # held offers is bounded per request: keep the newest, drop the oldest.
         self._max_pending_boundary_offloads = 8
@@ -1292,6 +1297,15 @@ class OffloadingConnectorScheduler:
                 ]
                 pending.append((group_idx, block_id, boundary_tokens))
 
+    def _note_boundary_lost(self, entries: Iterable[tuple[int, int, int]]) -> None:
+        """Count boundary offers given up for good, per group.
+
+        A refusal is retried and therefore only deferred; an offer dropped here
+        is never offered again, so it is the one case that is a loss.
+        """
+        for group_idx, _block_id, _boundary_tokens in entries:
+            self._boundary_lost[group_idx] = self._boundary_lost.get(group_idx, 0) + 1
+
     def _drop_pending_boundary_offloads(
         self, req_status: RequestOffloadState, reason: str
     ) -> None:
@@ -1306,6 +1320,7 @@ class OffloadingConnectorScheduler:
             [entry[2] for entry in pending],
             reason,
         )
+        self._note_boundary_lost(pending)
         pending.clear()
 
     def _add_boundary_attention_keys(
@@ -1456,6 +1471,8 @@ class OffloadingConnectorScheduler:
                     or boundary_tokens % group_config.offloaded_block_size != 0
                 ):
                     self._boundary_skips["retrycap"] += 1
+                    # Never storable: the offer is given up, not deferred.
+                    self._note_boundary_lost([entry])
                     continue
                 by_boundary.setdefault(boundary_tokens, []).append(entry)
 
@@ -1512,9 +1529,12 @@ class OffloadingConnectorScheduler:
                     continue
                 if not keys:
                     continue
-                store_output = self.manager.prepare_store(
-                    keys, req_status.req_context
-                )
+                # The bundle is a pair per group: the state of the block plus
+                # its attention KV. Hand it to the pool as one atomic, priority
+                # offer -- priority so the state pool's reserve is available to
+                # it, atomic so it is admitted whole or not at all (a half pair
+                # is unreadable on disk and only costs capacity).
+                store_output = self._prepare_boundary_store(keys, req_status)
                 if store_output is None:
                     logger.debug(
                         "Request %s: host tier busy, retrying Mamba boundary "
@@ -1543,6 +1563,15 @@ class OffloadingConnectorScheduler:
                     # without its state (or the reverse) never yields a hit.
                     self._boundary_skips["busy"] += 1
                     still_pending.extend(entries)
+                    # Give back the slots the tier took for the part it did
+                    # admit. Returning them is what makes the pair atomic: the
+                    # blocks are placed but no job is issued for them, so
+                    # without this release they stay allocated, unreadable and
+                    # unreachable until eviction.
+                    self.manager.complete_store(
+                        keys_to_store, req_status.req_context, success=False
+                    )
+                    continue
 
                 ordered_keys = [k for k in keys if k in keys_to_store]
                 group_sizes = [0] * num_groups
@@ -1581,6 +1610,8 @@ class OffloadingConnectorScheduler:
                 dropped = still_pending[:surplus]
                 still_pending = still_pending[surplus:]
                 self._boundary_skips["retrycap"] += len(dropped)
+                # Given up by the queue cap: never offered again, so a loss.
+                self._note_boundary_lost(dropped)
                 logger.warning(
                     "Request %s: dropping %d held Mamba boundary state(s) at %s "
                     "tokens, queue cap is %d",
@@ -1593,30 +1624,62 @@ class OffloadingConnectorScheduler:
 
         return store_jobs
 
+    def _prepare_boundary_store(
+        self, keys: Sequence[OffloadKey], req_status: RequestOffloadState
+    ) -> PrepareStoreOutput | None:
+        """Offer one boundary bundle to the host tier as an atomic pair.
+
+        A manager that knows about the boundary reserve (the grouped CPU
+        manager) takes `priority`/`atomic`; any other manager is called with the
+        plain signature and keeps its previous behaviour.
+        """
+        req_context = req_status.req_context
+        if getattr(self.manager, "supports_priority_store", False):
+            return self.manager.prepare_store(
+                keys, req_context, priority=True, atomic=True
+            )
+        return self.manager.prepare_store(keys, req_context)
+
     def _publish_boundary_stats(self) -> None:
         """Hand the boundary-store counters to the pool that logs them.
 
         The state cap and the boundary path live in this process, next to the
         primary pool, so the counters are pushed here instead of being kept in
         two places. Counters are per interval, like the pool's own stats.
+        `deferred_unresolved` is a gauge, not a delta: it is the number of
+        boundary offers held pending (neither written nor dropped) right now, so
+        it is published every step even when no counter moved.
         """
         skips = self._boundary_skips
-        if not (self._boundary_pre or any(skips.values())):
-            return
         sink = getattr(self.manager, "note_boundary_attempt", None)
         if sink is None:
             # No grouped pool to publish to (the counters stay here and the
             # periodic OFFLOAD-DEFER line reports them).
+            return
+        pending: dict[int, int] = {}
+        for req_status in self._req_status.values():
+            for group_idx, _block_id, _tokens in req_status.pending_boundary_offloads:
+                pending[group_idx] = pending.get(group_idx, 0) + 1
+        lost = self._boundary_lost
+        if not (self._boundary_pre or any(skips.values()) or lost or pending):
+            sink(pending=pending)
             return
         sink(
             pre=self._boundary_pre,
             not_ready=skips["not_ready"],
             busy=skips["busy"],
             retrycap=skips["retrycap"],
+            lost=sum(lost.values()),
+            pending=pending,
+            # Per-group split: the sum alone cannot fill the per-group `lost`
+            # column, so a loss stayed invisible per group and AC-3 checked zero
+            # against a counter that was never written.
+            lost_keys=dict(lost),
         )
         self._boundary_pre = 0
         for name in skips:
             skips[name] = 0
+        lost.clear()
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
