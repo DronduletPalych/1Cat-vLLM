@@ -1546,31 +1546,23 @@ class OffloadingConnectorScheduler:
                     still_pending.extend(entries)
                     continue
                 keys_to_store = set(store_output.keys_to_store)
-                if not keys_to_store:
-                    if store_output.deferred_keys:
-                        # Nothing placed, keys still queued for a slot: keep the
-                        # hand-off pending or it is never offered again.
-                        self._boundary_skips["busy"] += 1
-                        still_pending.extend(entries)
-                        continue
-                    # Every key is already in the tier (an identical prefix was
-                    # stored before). Nothing to transfer and nothing to retry.
-                    continue
-                if len(keys_to_store) < len(keys):
-                    # The host tier admitted only part of the boundary bundle.
-                    # Keep the offer pending so a later step can finish the
-                    # groups that were refused; storing the attention half
-                    # without its state (or the reverse) never yields a hit.
+                if store_output.deferred_keys:
+                    # Part of the pair could not be placed this step. Keep the
+                    # whole offer pending: storing the attention half without
+                    # its state (or the reverse) never yields a hit. The keys
+                    # the tier did take were placed under this offer, so their
+                    # slots are given back -- nothing was written for them, and
+                    # the offer is retried, so this is not a loss.
                     self._boundary_skips["busy"] += 1
                     still_pending.extend(entries)
-                    # Give back the slots the tier took for the part it did
-                    # admit. Returning them is what makes the pair atomic: the
-                    # blocks are placed but no job is issued for them, so
-                    # without this release they stay allocated, unreadable and
-                    # unreachable until eviction.
-                    self.manager.complete_store(
-                        keys_to_store, req_status.req_context, success=False
-                    )
+                    if keys_to_store:
+                        self.manager.discard_store(
+                            keys_to_store, req_status.req_context
+                        )
+                    continue
+                if not keys_to_store:
+                    # Every key is already in the tier (an identical prefix was
+                    # stored before). Nothing to transfer and nothing to retry.
                     continue
 
                 ordered_keys = [k for k in keys if k in keys_to_store]
