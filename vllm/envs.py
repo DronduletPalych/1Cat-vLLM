@@ -222,6 +222,7 @@ if TYPE_CHECKING:
     VLLM_VIDEO_LOADER_BACKEND: str = "opencv"
     VLLM_MEDIA_CONNECTOR: str = "http"
     VLLM_MM_HASHER_ALGORITHM: str = "blake3"
+    VLLM_MRV2_WARMUP_EXTENDED: bool = True
     VLLM_TARGET_DEVICE: str = "cuda"
     VLLM_MAIN_CUDA_VERSION: str = "13.0"
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
@@ -2931,6 +2932,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # - "sha256": FIPS 140-3 compliant, widely supported
     # - "sha512": FIPS 140-3 compliant, faster on 64-bit systems
     # Use sha256 or sha512 for FIPS compliance in government/enterprise deployments
+    "VLLM_MRV2_WARMUP_EXTENDED": env_var(
+        lambda: bool(int(os.getenv("VLLM_MRV2_WARMUP_EXTENDED", "1"))),
+        description=(
+            "Run the extended MRV2 kernel warmup: the full prefill chunk plus "
+            "one decode cycle per request count and one whose decode step "
+            "admits a prefill. Turn it off on devices where those extra cycles "
+            "do not fit in the memory left after the KV pool has been "
+            "allocated; warmup then runs only the short max_num_seqs profile, "
+            "as releases before 1CatAI/1Cat-vLLM#1402 did."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("MRV2 kernel warmup",),
+        user_visible=False,
+    ),
     "VLLM_MM_HASHER_ALGORITHM": env_var(
         env_with_choices(
             "VLLM_MM_HASHER_ALGORITHM",
