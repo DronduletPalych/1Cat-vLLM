@@ -409,6 +409,20 @@ class CPUOffloadingManager(OffloadingManager):
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
         self._policy.touch(keys)
 
+    def resident_keys(self, keys: Collection[OffloadKey]) -> list[OffloadKey]:
+        """Keys whose block is resident here and fully written (readable).
+
+        Used by the tiering manager to persist live blocks downwards: only a
+        ready block can be read from the pool's memory view, and a block that
+        is still being written must be offered again later.
+        """
+        resident: list[OffloadKey] = []
+        for key in keys:
+            block = self._policy.get(key)
+            if block is not None and block.is_ready:
+                resident.append(key)
+        return resident
+
     def demote(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
         self._policy.demote(keys)
 
