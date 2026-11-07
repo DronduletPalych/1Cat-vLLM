@@ -3,11 +3,14 @@
 
 from collections.abc import Callable
 from typing import Any
+import os
 
 import numpy as np
 import torch
 
 from vllm import PoolingParams, SamplingParams
+from vllm import envs
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -24,6 +27,42 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import Request
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+logger = init_logger(__name__)
+
+# Unregistered alias for VLLM_MRV2_WARMUP_EXTENDED. Variables declared in
+# vllm/envs.py are dropped from the environment of the EngineCore/Worker
+# processes on this fork, so a deployment cannot switch the extended profiles
+# off through the registry alone; a plain os.environ name survives the spawn.
+_EXTENDED_WARMUP_ALIAS = "VLLM_SM70_MRV2_WARMUP_FULL"
+
+
+def _extended_warmup_enabled() -> bool:
+    """Whether the #1402 extra warmup profiles should run."""
+    if os.environ.get(_EXTENDED_WARMUP_ALIAS, "1") == "0":
+        return False
+    return bool(envs.VLLM_MRV2_WARMUP_EXTENDED)
+
+
+def _warmup_cycle_optional(name: str, *args, **kwargs) -> bool:
+    """Run one optional warmup profile.
+
+    These profiles only pre-compile kernels for shapes that would otherwise
+    compile on the serving path, so a profile that does not fit in the
+    remaining GPU memory must not abort startup. Returns True when it ran.
+    """
+    try:
+        _warmup_cycle(*args, **kwargs)
+    except torch.OutOfMemoryError:
+        logger.warning(
+            "Warmup profile %s skipped: not enough free GPU memory "
+            "(set %s=0 to skip all extended profiles).",
+            name,
+            _EXTENDED_WARMUP_ALIAS,
+        )
+        torch.cuda.empty_cache()
+        return False
+    return True
 
 
 def _kernel_prefill_warmup_token_counts(
@@ -224,7 +263,8 @@ def warmup_kernels(
     prompt_lengths = _kernel_prefill_warmup_token_counts(
         model_runner, default_prompt_len
     )
-    if not model_runner.is_pooling_model:
+    extended_warmup = _extended_warmup_enabled()
+    if extended_warmup and not model_runner.is_pooling_model:
         # A full prefill chunk: long-row kernel variants and Triton's
         # divisible-by-16 specializations that the short prompts never reach.
         full_chunk = min(
@@ -273,27 +313,44 @@ def warmup_kernels(
                 num_reqs = profile_reqs
             if profile_reqs <= 0:
                 continue
-            _warmup_cycle(
-                model_runner,
-                worker_execute_model,
-                worker_sample_tokens,
-                f"{profile_idx}",
-                profile_reqs,
-                prompt_len,
-                sampling_params,
-                pooling_params,
-                block_count,
-                kv_cache_specs,
-                with_grammar=profile_idx == 0,
-            )
-        if not model_runner.is_pooling_model:
+            if profile_idx == 0:
+                _warmup_cycle(
+                    model_runner,
+                    worker_execute_model,
+                    worker_sample_tokens,
+                    f"{profile_idx}",
+                    profile_reqs,
+                    prompt_len,
+                    sampling_params,
+                    pooling_params,
+                    block_count,
+                    kv_cache_specs,
+                    with_grammar=True,
+                )
+            else:
+                _warmup_cycle_optional(
+                    f"profile{profile_idx}",
+                    model_runner,
+                    worker_execute_model,
+                    worker_sample_tokens,
+                    f"{profile_idx}",
+                    profile_reqs,
+                    prompt_len,
+                    sampling_params,
+                    pooling_params,
+                    block_count,
+                    kv_cache_specs,
+                    with_grammar=False,
+                )
+        if extended_warmup and not model_runner.is_pooling_model:
             # Several kernels specialize on the request count, and a step that
             # admits a prefill beside decoding requests takes its own route.
             # Without this, the first batch at each concurrency compiles them
             # while serving it (about 1 s of TTFT per new shape).
             for count in range(num_reqs - 1, 0, -1):
                 for mixed in (False, True):
-                    _warmup_cycle(
+                    _warmup_cycle_optional(
+                        f"c{count}{'m' if mixed else 'd'}",
                         model_runner,
                         worker_execute_model,
                         worker_sample_tokens,
