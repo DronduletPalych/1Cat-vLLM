@@ -48,6 +48,9 @@ def test_kernel_prefill_warmup_profiles_are_capability_advertised() -> None:
 def test_kernel_prefill_warmup_runs_default_batch_and_extra_profile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The extended profiles are on by default; pin the flag so an ambient
+    # VLLM_MRV2_WARMUP_EXTENDED=0 in the environment cannot change the trace.
+    monkeypatch.setenv("VLLM_MRV2_WARMUP_EXTENDED", "1")
     connector_states: list[bool] = []
     attention_spec = _full_attention_spec()
     runner = SimpleNamespace(

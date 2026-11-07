@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from vllm import PoolingParams, SamplingParams
+from vllm import PoolingParams, SamplingParams, envs
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -215,6 +215,12 @@ def warmup_kernels(
     The first iteration simulates a prefill with requests of
     2 + num_spec_steps prompt tokens each. The second iteration simulates
     a decode step with all requests generating 1 + num_spec_steps tokens.
+
+    The extended coverage added in 1CatAI/1Cat-vLLM#1402 (a full prefill
+    chunk and one cycle per request count) is gated by
+    ``VLLM_MRV2_WARMUP_EXTENDED``. It is on by default; deployments whose
+    KV pool leaves too little headroom for the extra cycles set it to 0 and
+    warm up the short max_num_seqs profile only.
     """
     num_spec_steps = model_runner.num_speculative_steps
     # Use 1 + num_spec_steps + 1 tokens so the prefill batch's per-request
@@ -224,7 +230,8 @@ def warmup_kernels(
     prompt_lengths = _kernel_prefill_warmup_token_counts(
         model_runner, default_prompt_len
     )
-    if not model_runner.is_pooling_model:
+    extended_warmup = envs.VLLM_MRV2_WARMUP_EXTENDED
+    if not model_runner.is_pooling_model and extended_warmup:
         # A full prefill chunk: long-row kernel variants and Triton's
         # divisible-by-16 specializations that the short prompts never reach.
         full_chunk = min(
@@ -286,7 +293,7 @@ def warmup_kernels(
                 kv_cache_specs,
                 with_grammar=profile_idx == 0,
             )
-        if not model_runner.is_pooling_model:
+        if not model_runner.is_pooling_model and extended_warmup:
             # Several kernels specialize on the request count, and a step that
             # admits a prefill beside decoding requests takes its own route.
             # Without this, the first batch at each concurrency compiles them
