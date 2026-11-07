@@ -3,11 +3,14 @@
 
 from collections.abc import Callable
 from typing import Any
+import os
 
 import numpy as np
 import torch
 
 from vllm import PoolingParams, SamplingParams
+from vllm import envs
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -24,6 +27,42 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import Request
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+logger = init_logger(__name__)
+
+# Unregistered alias for VLLM_MRV2_WARMUP_EXTENDED. Variables declared in
+# vllm/envs.py are dropped from the environment of the EngineCore/Worker
+# processes on this fork, so a deployment cannot switch the extended profiles
+# off through the registry alone; a plain os.environ name survives the spawn.
+_EXTENDED_WARMUP_ALIAS = "VLLM_SM70_MRV2_WARMUP_FULL"
+
+
+def _extended_warmup_enabled() -> bool:
+    """Whether the #1402 extra warmup profiles should run."""
+    if os.environ.get(_EXTENDED_WARMUP_ALIAS, "1") == "0":
+        return False
+    return bool(envs.VLLM_MRV2_WARMUP_EXTENDED)
+
+
+def _warmup_cycle_optional(name: str, *args, **kwargs) -> bool:
+    """Run one optional warmup profile.
+
+    These profiles only pre-compile kernels for shapes that would otherwise
+    compile on the serving path, so a profile that does not fit in the
+    remaining GPU memory must not abort startup. Returns True when it ran.
+    """
+    try:
+        _warmup_cycle(*args, **kwargs)
+    except torch.OutOfMemoryError:
+        logger.warning(
+            "Warmup profile %s skipped: not enough free GPU memory "
+            "(set %s=0 to skip all extended profiles).",
+            name,
+            _EXTENDED_WARMUP_ALIAS,
+        )
+        torch.cuda.empty_cache()
+        return False
+    return True
 
 
 def _kernel_prefill_warmup_token_counts(
@@ -119,35 +158,17 @@ def _warmup_cycle(
         d - p for d, p in zip(decode_block_counts, prefill_block_counts)
     ]
     req_ids = [f"_warmup_{tag}_{i}_" for i in range(num_reqs)]
-    # A bounded state pool backs state groups with only IDs below
-    # ``device_state_blocks``; history groups use the IDs above it (#1490).
-    kv_cache_config = model_runner.kv_cache_config
-    state_blocks = getattr(kv_cache_config, "device_state_blocks", 0) or 0
-    state_group_ids = frozenset(
-        getattr(kv_cache_config, "device_state_group_ids", ()) or ()
-    )
-    next_block_id = max(1, state_blocks)
-    next_state_id = 0
+    next_block_id = 1
 
-    def _alloc_blocks(num_blocks: int, group_id: int) -> list[int]:
-        nonlocal next_block_id, next_state_id
-        if state_blocks and group_id in state_group_ids:
-            # Warmup contents are discarded, so state IDs may repeat once the
-            # range is used up; they must only stay inside the state tensors.
-            ids = [
-                1 + (next_state_id + i) % (state_blocks - 1) for i in range(num_blocks)
-            ]
-            next_state_id += num_blocks
-            return ids
+    def _alloc_blocks(num_blocks: int) -> list[int]:
+        nonlocal next_block_id
         return list(range(next_block_id, next_block_id := next_block_id + num_blocks))
 
     def _new_requests(ids: list[str]) -> list[NewRequestData]:
         return [
             NewRequestData.from_request(
                 Request(req_id, prompt_token_ids, sampling_params, pooling_params),
-                block_ids=tuple(
-                    _alloc_blocks(n, g) for g, n in enumerate(prefill_block_counts)
-                ),
+                block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
                 prefill_token_ids=prompt_token_ids,
             )
             for req_id in ids
@@ -186,7 +207,7 @@ def _warmup_cycle(
         new_block = any(decode_block_deltas)
         cached_req_data.new_block_ids = [
             (
-                tuple(_alloc_blocks(n, g) for g, n in enumerate(decode_block_deltas))
+                tuple(_alloc_blocks(n) for n in decode_block_deltas)
                 if new_block
                 else None
             )
@@ -217,14 +238,6 @@ def _warmup_cycle(
 
     cleanup_output = SchedulerOutput.make_empty()
     cleanup_output.finished_req_ids = finished
-    if getattr(kv_cache_config, "needs_kv_cache_zeroing", False):
-        touched_end = min(next_block_id, kv_cache_config.num_blocks)
-        state_end = min(state_blocks, 1 + next_state_id) if next_state_id > 0 else 1
-        dirty_ids = list(range(1, state_end)) + list(
-            range(max(1, state_blocks), touched_end)
-        )
-        if dirty_ids:
-            cleanup_output.new_block_ids_to_zero = dirty_ids
     worker_execute_model(cleanup_output)
 
 
@@ -250,28 +263,16 @@ def warmup_kernels(
     prompt_lengths = _kernel_prefill_warmup_token_counts(
         model_runner, default_prompt_len
     )
-    if not model_runner.is_pooling_model:
+    extended_warmup = _extended_warmup_enabled()
+    if extended_warmup and not model_runner.is_pooling_model:
         # A full prefill chunk: long-row kernel variants and Triton's
         # divisible-by-16 specializations that the short prompts never reach.
         full_chunk = min(
             model_runner.scheduler_config.max_num_batched_tokens,
             model_runner.max_model_len - 1 - num_spec_steps,
         )
-        extra_lengths = [full_chunk]
-        if (
-            num_spec_steps > 0
-            and default_prompt_len < 16
-            and model_runner.max_model_len - 1 - num_spec_steps >= 16
-        ):
-            extra_lengths.append(16)
-        prompt_lengths = tuple(
-            sorted(
-                {
-                    *prompt_lengths,
-                    *(n for n in extra_lengths if n > default_prompt_len),
-                }
-            )
-        )
+        if full_chunk > default_prompt_len:
+            prompt_lengths = tuple(sorted({*prompt_lengths, full_chunk}))
 
     kv_cache_groups = model_runner.kv_cache_config.kv_cache_groups
     block_count = _warmup_block_counter(model_runner)
@@ -279,18 +280,10 @@ def warmup_kernels(
 
     # SamplingParams exercising all sampling features.
     if model_runner.is_pooling_model:
-        sampling_params = profile_sampling_params = None
+        sampling_params = None
         pooling_params = PoolingParams()
     else:
         sampling_params = SamplingParams.for_sampler_warmup()
-        # The larger prefill profiles (kernel-advertised sizes, a full chunk)
-        # warm the model's kernels; the default batch already exercises prompt
-        # logprobs. There they would build FP32 logits for every prompt token
-        # (605 MiB for a 1024-token chunk of a 154,880-token vocabulary), which
-        # the allocator keeps reserved on the last pipeline rank.
-        profile_sampling_params = SamplingParams.for_sampler_warmup(
-            prompt_logprobs=None
-        )
         pooling_params = None
 
     # Disable KV connector for all warmup runs. Kernel-advertised profiles run
@@ -320,34 +313,51 @@ def warmup_kernels(
                 num_reqs = profile_reqs
             if profile_reqs <= 0:
                 continue
-            _warmup_cycle(
-                model_runner,
-                worker_execute_model,
-                worker_sample_tokens,
-                f"{profile_idx}",
-                profile_reqs,
-                prompt_len,
-                profile_sampling_params if profile_idx else sampling_params,
-                pooling_params,
-                block_count,
-                kv_cache_specs,
-                with_grammar=profile_idx == 0,
-            )
-        if not model_runner.is_pooling_model:
+            if profile_idx == 0:
+                _warmup_cycle(
+                    model_runner,
+                    worker_execute_model,
+                    worker_sample_tokens,
+                    f"{profile_idx}",
+                    profile_reqs,
+                    prompt_len,
+                    sampling_params,
+                    pooling_params,
+                    block_count,
+                    kv_cache_specs,
+                    with_grammar=True,
+                )
+            else:
+                _warmup_cycle_optional(
+                    f"profile{profile_idx}",
+                    model_runner,
+                    worker_execute_model,
+                    worker_sample_tokens,
+                    f"{profile_idx}",
+                    profile_reqs,
+                    prompt_len,
+                    sampling_params,
+                    pooling_params,
+                    block_count,
+                    kv_cache_specs,
+                    with_grammar=False,
+                )
+        if extended_warmup and not model_runner.is_pooling_model:
             # Several kernels specialize on the request count, and a step that
             # admits a prefill beside decoding requests takes its own route.
             # Without this, the first batch at each concurrency compiles them
             # while serving it (about 1 s of TTFT per new shape).
             for count in range(num_reqs - 1, 0, -1):
                 for mixed in (False, True):
-                    _warmup_cycle(
+                    _warmup_cycle_optional(
+                        f"c{count}{'m' if mixed else 'd'}",
                         model_runner,
                         worker_execute_model,
                         worker_sample_tokens,
                         f"c{count}{'m' if mixed else 'd'}",
                         count,
                         default_prompt_len,
-                        profile_sampling_params,
+                        sampling_params,
                         pooling_params,
                         block_count,
                         kv_cache_specs,
@@ -357,5 +367,3 @@ def warmup_kernels(
     finally:
         model_runner.kv_connector.set_disabled(False)
     torch.accelerator.synchronize()
-    if torch.accelerator.is_available():
-        torch.accelerator.empty_cache()
