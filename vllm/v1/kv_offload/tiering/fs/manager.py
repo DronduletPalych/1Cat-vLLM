@@ -174,6 +174,16 @@ class FileSystemTierManager(SecondaryTierManager):
         self._stats_lookup_hits = 0
         self._stats_last_log = time.monotonic()
 
+        # Miss classification (env-gated with the other I/O counters): for
+        # every file-system lookup that misses, remember whether this instance
+        # ever committed a file under that path.  Without it a low hit rate
+        # cannot be attributed to "never written" vs "written and evicted".
+        self._ever_stored: dict[str, None] = {}
+        self._ever_stored_limit = 400_000
+        self._miss_never = 0
+        self._miss_evicted = 0
+        self._miss_log_step = 2000
+
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         return RequestOffloadingContext()
 
@@ -189,6 +199,8 @@ class FileSystemTierManager(SecondaryTierManager):
             # Recency: a looked-up (and therefore soon to be promoted) block is
             # the last candidate for eviction.
             self._cap.touch(name)
+        elif self._stats_enabled:
+            self._classify_miss(name)
         self._cap.note_lookup(exists)
         if self._stats_enabled:
             self._stats_lookups += 1
@@ -214,6 +226,31 @@ class FileSystemTierManager(SecondaryTierManager):
                 )
         return exists
 
+    def _classify_miss(self, name: str) -> None:
+        """Count a miss as "never committed here" or "committed, now gone"."""
+        if name in self._ever_stored:
+            self._miss_evicted += 1
+        else:
+            self._miss_never += 1
+        total = self._miss_never + self._miss_evicted
+        if self._stats_lookups <= 8 or total % self._miss_log_step == 0:
+            logger.info(
+                "FS-MISS-CLASS misses=%d never=%d evicted=%d hits=%d",
+                total,
+                self._miss_never,
+                self._miss_evicted,
+                self._stats_lookup_hits,
+            )
+
+    def _remember_stored(self, name: str) -> None:
+        if name in self._ever_stored:
+            return
+        self._ever_stored[name] = None
+        if len(self._ever_stored) > self._ever_stored_limit:
+            drop = list(self._ever_stored)[: self._ever_stored_limit // 10]
+            for old in drop:
+                del self._ever_stored[old]
+
     def touch(self, keys, req_context=None) -> None:
         """Mark blocks as recently read (LRU recency)."""
         for key in keys:
@@ -231,6 +268,8 @@ class FileSystemTierManager(SecondaryTierManager):
             self._pending_paths.discard(path)
         self._cap.commit_store(path, self._slot_bytes)
         self._cap.note_store_block()
+        if self._stats_enabled:
+            self._remember_stored(path)
 
     def submit_store(self, job_metadata: JobMetadata) -> None:
         """Queue a primary->disk cascade for one job.
@@ -250,6 +289,8 @@ class FileSystemTierManager(SecondaryTierManager):
                 # Already on disk (and already accounted by the startup scan or
                 # by an earlier commit): nothing to write, nothing to reserve.
                 self._cap.touch(path)
+                if self._stats_enabled:
+                    self._remember_stored(path)
                 continue
             if not self._cap.try_reserve(path, self._slot_bytes):
                 for res_path, _ in reserved:
