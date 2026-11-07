@@ -63,6 +63,11 @@ class TransferJobStatus:
 
 
 _DBG_LOOKUP = os.environ.get("VLLM_OFFLOAD_DEBUG_LOOKUP", "0") == "1"
+# Write-through of prompt blocks (unregistered on purpose: variables declared
+# in vllm/envs.py are dropped from the EngineCore/Worker environment on this
+# fork). The primary pool only forwards what it evicts, so a prefix that stays
+# hot is never written to disk and does not survive a restart.
+_PERSIST_PROMPT_BLOCKS = os.environ.get("VLLM_SM70_PERSIST_PROMPT", "1") != "0"
 # Diagnostic only: comma separated KV group indices whose host-tier load is
 # skipped while the lookup still reports the prefix as a hit. Used to tell a
 # broken restored KV from a broken restored Mamba state.
@@ -1758,6 +1763,8 @@ class OffloadingConnectorScheduler:
             return False, None
         if self.config.demote_superseded_states:
             self._demote_superseded_states(req_status)
+        if _PERSIST_PROMPT_BLOCKS:
+            self._persist_prompt_blocks(req_status)
         # Blocks are freed right after this call; a store for a still
         # pending boundary offer could not be issued before block reuse.
         self._drop_pending_boundary_offloads(req_status, "request finished")
@@ -1790,6 +1797,31 @@ class OffloadingConnectorScheduler:
                 keys.extend(group_keys[: len(group_keys) - keep])
         if keys:
             self.manager.demote(keys, req_status.req_context)
+
+    def _persist_prompt_blocks(self, req_status: RequestOffloadState) -> None:
+        """Copy the request's prompt blocks down while they are still hot.
+
+        A request's prefix is the part other requests can reuse, and it is the
+        part that stays resident in the primary pool. Forwarding it to the
+        secondary tier on eviction alone means the hottest prefix never reaches
+        the disk, so nothing survives a restart. The copy is deduplicated by the
+        tier itself (an existing file costs one stat), so re-offering a shared
+        prefix is cheap.
+        """
+        num_prompt_tokens = req_status.req.num_prompt_tokens
+        keys: list[OffloadKey] = []
+        for group_config in self.config.kv_group_configs:
+            if group_config.requires_exact_boundary_source:
+                # Mamba state blocks are persisted by the boundary path.
+                continue
+            group_state = req_status.group_states[group_config.group_idx]
+            group_keys = group_state.offload_keys
+            if self.config.offload_prompt_only:
+                num_blocks = num_prompt_tokens // group_config.offloaded_block_size
+                group_keys = group_keys[:num_blocks]
+            keys.extend(group_keys)
+        if keys:
+            self.manager.persist(keys, req_status.req_context)
 
     def take_events(self) -> Iterable[KVCacheEvent]:
         """Take the KV cache events from the connector.
