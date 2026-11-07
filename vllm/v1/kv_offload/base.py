@@ -202,6 +202,22 @@ class OffloadingManager(ABC):
         """
         return
 
+    def persist(self, keys: Collection[OffloadKey], req_context: ReqContext) -> int:
+        """
+        Write the given blocks down to slower tiers while they are still hot.
+
+        Tiers that only receive evictions cannot keep a prefix that never gets
+        evicted, so a single-tier manager does nothing here.
+
+        Args:
+            keys: the keys identifying the blocks.
+            req_context: per-request context (e.g. kv_transfer_params).
+
+        Returns:
+            The number of tiers the copy was submitted to.
+        """
+        return 0
+
     def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
         """
         Marks previous blocks that were prepared to load as done loading.
