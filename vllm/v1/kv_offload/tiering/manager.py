@@ -690,6 +690,57 @@ class TieringOffloadingManager(OffloadingManager):
         """Demote in the CPU tier; secondary tiers keep their own policy."""
         self.primary_tier.demote(keys, req_context)
 
+    def persist(self, keys: Collection[OffloadKey], req_context: ReqContext) -> int:
+        """Write resident primary blocks down to every secondary tier now.
+
+        The primary pool only forwards what it evicts, so a block that stays
+        hot is never written to disk: after a restart the hottest prefixes —
+        exactly the ones worth keeping — are gone. This copies a request's
+        blocks while they are still resident so they survive a restart.
+
+        Residency is checked first and the readable blocks are pinned with
+        ``prepare_load``; the matching ``complete_read`` runs from
+        ``_process_finished_jobs`` when the transfer finishes, so the pins
+        cannot leak. Returns the number of tiers the copy was submitted to.
+        """
+        if not self.secondary_tiers or not keys:
+            return 0
+        resident = self.primary_tier.resident_keys(keys)
+        if not resident:
+            return 0
+
+        store_spec = self.primary_tier.prepare_load(resident, req_context)
+        assert isinstance(store_spec, CPULoadStoreSpec)
+        block_ids = np.array(store_spec.block_ids, dtype=np.int64)
+        submitted = 0
+        for tier in self.secondary_tiers:
+            job_id = self._next_job_id()
+            job_metadata = JobMetadata(
+                job_id=job_id,
+                keys=resident,
+                block_ids=block_ids,
+                is_promotion=False,
+                req_context=req_context,
+            )
+            self._transfer_jobs[job_id] = job_metadata
+            try:
+                tier.submit_store(job_metadata)
+            except Exception:
+                logger.exception(
+                    "OFFLOAD-PERSIST-ERROR tier=%s job=%s keys=%d",
+                    tier.tier_type,
+                    job_id,
+                    len(resident),
+                )
+                self._transfer_jobs.pop(job_id, None)
+            else:
+                submitted += 1
+
+        if submitted == 0:
+            # Nothing took the copy: release the pins this call just took.
+            self.primary_tier.complete_read(resident, req_context)
+        return submitted
+
     def pool_stats(self) -> tuple[int, int, int, int, int, int]:
         """Slot accounting of the primary pool, delegated to the tier that owns it."""
         return self.primary_tier.pool_stats()
