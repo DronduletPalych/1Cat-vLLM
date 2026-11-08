@@ -30,10 +30,11 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 logger = init_logger(__name__)
 
-# Unregistered alias for VLLM_MRV2_WARMUP_EXTENDED. Variables declared in
-# vllm/envs.py are dropped from the environment of the EngineCore/Worker
-# processes on this fork, so a deployment cannot switch the extended profiles
-# off through the registry alone; a plain os.environ name survives the spawn.
+# Launcher-level override for VLLM_MRV2_WARMUP_EXTENDED. Worker processes only
+# inherit names declared in vllm/envs.py, so the registered variable is the
+# supported switch; this unregistered name is an extra convenience for scripts
+# that start vllm directly (it is read from os.environ, so it works wherever a
+# script export survives into the process).
 _EXTENDED_WARMUP_ALIAS = "VLLM_SM70_MRV2_WARMUP_FULL"
 
 

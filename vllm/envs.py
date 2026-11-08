@@ -610,6 +610,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MTP_PROFILE_INTERVAL: int = 16
     VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS: bool = False
     VLLM_SM70_MTP_CONCURRENCY_WARMUP: bool = False
+    VLLM_MRV2_WARMUP_EXTENDED: bool = True
     VLLM_SM70_MTP_CONTEXT_BUCKETS: str | None = None
     VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS: str | None = None
     VLLM_SM70_DSV4_PRIVATE_COMPRESSOR_STATE: bool = False
@@ -9463,6 +9464,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Compile alternate single/concurrent MTP helper signatures at startup.
     # Default-off until matched cold-start and steady-state evidence is complete.
+    "VLLM_MRV2_WARMUP_EXTENDED": env_var(
+        lambda: bool(int(os.getenv("VLLM_MRV2_WARMUP_EXTENDED", "1"))),
+        description=(
+            "Run the extra MRV2 warmup profiles (every request count, mixed "
+            "steps and a full chunk) that upstream #1402 added. Registered "
+            "here so the value also reaches the EngineCore and worker "
+            "processes, which only inherit names declared in this registry."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("MRV2 kernel warmup",),
+        user_visible=False,
+    ),
     "VLLM_SM70_MTP_CONCURRENCY_WARMUP": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MTP_CONCURRENCY_WARMUP", "0"))),
         description=(
