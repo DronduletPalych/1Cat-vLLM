@@ -45,7 +45,7 @@
 | 27 | [`5f389fe0c8`](https://github.com/DronduletPalych/1Cat-vLLM/commit/5f389fe0c8b5) | [`d3be1a0d2e`](https://github.com/DronduletPalych/1Cat-vLLM/commit/d3be1a0d2e26) | Submit host-tier loads even when the connector is wrapped |
 | 28 | [`5c0498c1c0`](https://github.com/DronduletPalych/1Cat-vLLM/commit/5c0498c1c06b) | [`07b446e03b`](https://github.com/DronduletPalych/1Cat-vLLM/commit/07b446e03b8c) | [KV Offload] Load the host tier before the Mamba preprocess in MRV2 |
 | 29 | [`98bcc401be`](https://github.com/DronduletPalych/1Cat-vLLM/commit/98bcc401beb1) | [`d83ca76577`](https://github.com/DronduletPalych/1Cat-vLLM/commit/d83ca7657798) | [KV Offload] Account capacity of the filesystem tier directory |
-| 30 | [`0259f5bafa`](https://github.com/DronduletPalych/1Cat-vLLM/commit/0259f5baf687) | [`76c7b3c421`](https://github.com/DronduletPalych/1Cat-vLLM/commit/76c7b3c421c1) | [KV Offload] Tell the grouped offload manager which groups hold Mamba state |
+| 30 | [`0259f5baf6`](https://github.com/DronduletPalych/1Cat-vLLM/commit/0259f5baf687) | [`76c7b3c421`](https://github.com/DronduletPalych/1Cat-vLLM/commit/76c7b3c421c1) | [KV Offload] Tell the grouped offload manager which groups hold Mamba state |
 | 31 | [`8d40e73b3b`](https://github.com/DronduletPalych/1Cat-vLLM/commit/8d40e73b3be0) | [`192a72ff2a`](https://github.com/DronduletPalych/1Cat-vLLM/commit/192a72ff2a73) | [KV Offload] Cap Mamba checkpoints in the filesystem tier |
 | 32 | [`c25034b247`](https://github.com/DronduletPalych/1Cat-vLLM/commit/c25034b24720) | [`128afac70b`](https://github.com/DronduletPalych/1Cat-vLLM/commit/128afac70bdc) | [KV Offload] Store the attention half together with a Mamba boundary state |
 | 33 | [`c37fd59c38`](https://github.com/DronduletPalych/1Cat-vLLM/commit/c37fd59c38c0) | [`4915f54c92`](https://github.com/DronduletPalych/1Cat-vLLM/commit/4915f54c92bb) | [KV Offload] Report failed tier stores and per-tier lookup statistics |
@@ -83,7 +83,7 @@
 | `sched/scheduler.py`, конструктор `KVCacheManager` | 4 новых аргумента | `watermark=self.scheduler_config.watermark` | union |
 | `sched/scheduler.py`, вызов `allocate_slots` | вызов обёрнут в `try/except KVPartialHitDriftError` (их фикс stale partial hit: дроп энтри и requeue) | аргумент `has_scheduled_reqs=bool(self.running)` | сохранены и обёртка, и аргумент |
 
-### 2. [`5ea59cc07e`](https://github.com/DronduletPalych/1Cat-vLLM/commit/5ea59cc07ef02165edf97e2fad4baa7b8c5b160f) → [`2fb389e2bf`](https://github.com/DronduletPalych/1Cat-vLLM/commit/2fb389e2bfffc23f6273ed35b9afcb7854bbad03) — [Core] Reserve the full ISL of admitted requests…
+### 2. [`5ea59cc07e`](https://github.com/DronduletPalych/1Cat-vLLM/commit/5ea59cc07ef02165edf97e2fad4baa7b8c5b160f) → [`2fb389e2bf`](https://github.com/DronduletPalych/1Cat-vLLM/commit/2fb389e2bfffc23f6273ed35b9afcb7854bbad03) — [Core] Reserve the full ISL of admitted requests and drop stale recv signals
 
 Один блок в `full_sequence_must_fit`: в одну точку упали upstream'ов `copy_last`-цикл (частные copy-on-write блоки partial hit, увеличивают `num_blocks_to_allocate`) и наш расчёт `other_reserved` (сумма ISL-резервов других admitted запросов из `self._reserved_blocks`). Оба блока оставлены, порядок: сначала цикл (он меняет `num_blocks_to_allocate`), затем `other_reserved`.
 
@@ -121,7 +121,7 @@
 | падений | 150 | 154 |
 
 - **Починены ребейзом (2):** `test_gpu_model_runner_v2_kv_zero.py::test_v2_initializes_kv_zeroer_from_all_attention_groups`, `::test_v2_warms_qwen38_mtp_moe_prefill_and_decode_shapes`.
-- **«Новые» (6):** `test_mamba_sparse_retention.py::test_sparse_retains_both_prompt_replay_boundaries[0-True-800/801]`, `[16000-True-800/801]`, `test_partial_prefix_cache.py::test_sm70_vision_default_unlimited_images_and_vit_sdpa_order`, `test_gpu_warmup_blocks.py::test_kernel_prefill_warmup_runs_default_batch_and_extra_profile`. **Все 6падают и на чистом upstream v1.5.4 без наших патчей** (mamba-семейство на чистом v1.5.4 валит 33 кейса) — не регрессия ребейза.
+- **«Новые» (6):** `test_mamba_sparse_retention.py::test_sparse_retains_both_prompt_replay_boundaries[0-True-800/801]`, `[16000-True-800/801]`, `test_partial_prefix_cache.py::test_sm70_vision_default_unlimited_images_and_vit_sdpa_order`, `test_gpu_warmup_blocks.py::test_kernel_prefill_warmup_runs_default_batch_and_extra_profile`. **Все 6 падают и на чистом upstream v1.5.4 без наших патчей** (mamba-семейство на чистом v1.5.4 валит 33 кейса) — не регрессия ребейза.
 - **Базовые 150 падений** — известная offload-defer регрессия, фикс в работе на ветке `fix/offload-defer-regression` (отдельный клон, WIP).
 
 ## Открытые вопросы
