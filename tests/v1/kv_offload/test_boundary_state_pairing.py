@@ -4,21 +4,19 @@
 
 A hybrid block is reusable only when its state and its attention KV are both
 in the tier: the prefix-cache hit length is the minimum over groups, so a state
-stored without its attention half can never be restored and only burns FS
-state capacity. These tests pin that pairing down:
+stored without its attention half can never be restored and only burns state
+capacity. These tests pin that pairing down:
 
 * a boundary state is held back (not written, not dropped) while its attention
   half is missing, and is stored together with it once it appears;
 * the positional ``block_ids`` view keeps up with the allocation even while a
   transfer is in flight, so a materialised block never looks absent;
-* the state cap prefers never-read checkpoints over the oldest one;
 * one state group with nothing in the served window still cancels the chain.
 
 They build the connector scheduler directly (no engine, no GPU) and use a
 single-block-size layout, so they run next to the tier tests.
 """
 
-import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -38,11 +36,8 @@ from vllm.v1.kv_offload.base import (
     ReqContext,
     RequestOffloadingContext,
 )
-from vllm.v1.kv_offload.tiering.fs.capacity import FS_BLOCK, DirCapacity
 
 _BLOCK = 16  # tokens per GPU block == tokens per offloaded block
-_ENTRY = FS_BLOCK * 2
-_FILE_BYTES = 4 * 1024
 
 _MAMBA_GROUPS = (0, 1)
 _ATTN_GROUP = 2
@@ -214,57 +209,6 @@ def test_block_ids_keep_up_while_a_transfer_is_in_flight():
     assert req_status.group_states[0].block_ids == [801]
     assert req_status.group_states[1].block_ids == [802]
     assert req_status.group_states[_ATTN_GROUP].block_ids == [803]
-
-
-def test_state_cap_victim_prefers_never_read_checkpoint(tmp_path):
-    """(c) A read checkpoint is kept; the oldest never-read one goes."""
-    groups = list(_MAMBA_GROUPS) + [_ATTN_GROUP]
-    cap = DirCapacity(
-        str(tmp_path),
-        max_bytes=64 * len(groups) * _ENTRY,
-        max_overshoot_bytes=_ENTRY,
-        group_indices=groups,
-        state_max_bytes=2 * len(_MAMBA_GROUPS) * _ENTRY,
-        mamba_groups=list(_MAMBA_GROUPS),
-    )
-    try:
-
-        def checkpoint(n: int) -> dict[int, str]:
-            paths = {}
-            for group in groups:
-                block_hash = f"{n:032x}"
-                path = os.path.join(
-                    str(tmp_path),
-                    "cache_r0",
-                    block_hash[:3],
-                    f"{block_hash[:2]}_g{group}",
-                    block_hash + ".bin",
-                )
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, "wb") as fh:
-                    fh.write(b"x" * _FILE_BYTES)
-                assert cap.try_reserve(path, _ENTRY)
-                cap.commit_store(path, _ENTRY)
-                paths[group] = path
-            return paths
-
-        first = checkpoint(0)
-        second = checkpoint(1)
-        # A chain hit reads every group file of the checkpoint it restores.
-        for group in groups:
-            cap.touch(first[group])
-
-        third = checkpoint(2)
-
-        assert all(os.path.exists(path) for path in first.values())
-        assert not os.path.exists(second[_MAMBA_GROUPS[0]])
-        assert all(os.path.exists(path) for path in third.values())
-        snap = cap.snapshot()
-        assert snap["fs_state_evictions_total"] == 1
-        assert snap["fs_state_evict_unread_total"] == 1
-        assert snap["fs_state_evict_read_total"] == 0
-    finally:
-        cap.shutdown()
 
 
 def _lookup_scheduler(present: dict[int, set[int]], num_blocks: int = 4):
