@@ -1646,6 +1646,20 @@ class MambaManager(SingleTypeKVCacheManager):
         if num_cached_blocks_before >= num_full_blocks:
             return
         boundaries = list(replay_boundaries)
+        # A Mamba state is readable only together with the whole attention chain
+        # below it, and only at the last page a request can resume from. With
+        # EAGLE/MTP the restore sits one page before the reach: the engine
+        # recomputes the final matched page because its snapshot may include
+        # draft tokens (MambaManager.find_longest_cache_hit, drop_eagle_block).
+        # So the checkpoint a continuation lands on is the page *before* the
+        # prompt end. Marking it keeps the state in the hash map; without the
+        # mark the only resumable blocks are the retention grid points, one per
+        # ``retention_interval`` tokens, and a continuation could resume no
+        # closer than the last grid point — losing up to a full interval of
+        # cached context that is physically present in both tiers.
+        prompt_blocks = cdiv(request.num_prompt_tokens, self.block_size)
+        if prompt_blocks > 1:
+            boundaries.append((prompt_blocks - 1) * self.block_size)
         if boundary := getattr(request, "shared_prefix_boundary", 0):
             boundaries.append(boundary)
         if req_boundaries := getattr(request, "prefix_cache_boundaries", None):
@@ -1700,17 +1714,19 @@ class MambaManager(SingleTypeKVCacheManager):
                 continue
             if self.mamba_cache_mode == "align":
                 # A state slot is worth one boundary: the one a later request
-                # resumes from, which is where this request's prompt ends.
-                # ``num_tokens`` arrives aligned down, so the first call that
-                # reaches the aligned prompt end is the one that carries it.
-                # Storing every intermediate step fills the small state pool
-                # with positions nothing can resume from and evicts the states
-                # of prefixes that are still cached, which turns the repeat of
-                # a cached prompt into a full recompute.
-                align = alignment_tokens or self.block_size
-                prompt_aligned = request.num_prompt_tokens // align * align
+                # resumes from. With EAGLE/MTP that is one page before the
+                # prompt end (the engine recomputes the final matched page), so
+                # hand off the last real state at or before that page. Handing
+                # off the prompt-end state instead stores a position the load
+                # path never looks at: it sits one page past the shifted
+                # window, and every continuation misses it and recomputes the
+                # whole prompt from the CPU tier.
+                checkpoint = max(
+                    cdiv(request.num_prompt_tokens, self.block_size) - 2, 0
+                )
                 if (
-                    num_tokens < prompt_aligned
+                    num_tokens < (checkpoint + 1) * self.block_size
+                    or block_idx > checkpoint
                     or request.request_id in self._prompt_state_done
                 ):
                     continue
