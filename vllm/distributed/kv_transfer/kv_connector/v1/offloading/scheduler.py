@@ -452,6 +452,7 @@ class OffloadingConnectorScheduler:
             "retrycap": 0,
             "superseded": 0,
             "beyond_policy": 0,
+            "unaligned": 0,
         }
         # Boundary offers dropped for good, per group: the queue cap evicted
         # them, the offer can never be addressed, or the request ended with the
@@ -1487,6 +1488,7 @@ class OffloadingConnectorScheduler:
 
             still_pending: list[tuple[int, int, int]] = []
             by_boundary: dict[int, list[tuple[int, int, int]]] = {}
+            unaligned: set[int] = set()
             for entry in pending:
                 group_idx, block_id, boundary_tokens = entry
                 group_config = self._group_config_by_idx[group_idx]
@@ -1503,7 +1505,18 @@ class OffloadingConnectorScheduler:
                     self._boundary_skips["retrycap"] += 1
                     self._boundary_skips["beyond_policy"] += 1
                     continue
+                if (
+                    group_config.requires_exact_boundary_source
+                    and self._mamba_align_size is not None
+                    and boundary_tokens % self._mamba_align_size != 0
+                ):
+                    self._boundary_skips["unaligned"] += 1
+                    unaligned.add(boundary_tokens)
+                    continue
                 by_boundary.setdefault(boundary_tokens, []).append(entry)
+
+            for boundary_tokens in unaligned:
+                by_boundary.pop(boundary_tokens, None)
 
             # One CPU page holds every KV group of a token block, so all groups
             # of a boundary must be handed to the manager as a single job.
@@ -1879,7 +1892,8 @@ class OffloadingConnectorScheduler:
                 "OFFLOAD-DEFER deferred_stores=%d deferred_promotions=%d "
                 "store_cannot_proceed=%d store_deferred=%d pinned_blocks=%d "
                 "inflight_jobs=%d boundary_pre=%d boundary_skip_not_ready=%d "
-                "boundary_skip_busy=%d boundary_skip_retrycap=%d",
+                "boundary_skip_busy=%d boundary_skip_retrycap=%d "
+                "boundary_skip_unaligned=%d",
                 st["deferred_stores"],
                 st["deferred_promotions"],
                 st["store_cannot_proceed"],
@@ -1890,6 +1904,7 @@ class OffloadingConnectorScheduler:
                 self._boundary_skips["not_ready"],
                 self._boundary_skips["busy"],
                 self._boundary_skips["retrycap"],
+                self._boundary_skips["unaligned"],
             )
             self._log_hit_split()
         for event in self.manager.take_events():
