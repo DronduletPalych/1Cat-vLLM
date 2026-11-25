@@ -189,7 +189,9 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         assert len(gpu_tensors) > 0
 
         # assert input tensors are as expected
-        for gpu_tensor, cpu_tensor in zip(gpu_tensors, cpu_tensors):
+        for tensor_idx, (gpu_tensor, cpu_tensor) in enumerate(
+            zip(gpu_tensors, cpu_tensors)
+        ):
             assert gpu_tensor.dtype == torch.int8
             assert gpu_tensor.ndim == 2
             assert gpu_tensor.is_cuda
@@ -198,7 +200,14 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             assert cpu_tensor.device.type == "cpu"
             _, gpu_page_size = gpu_tensor.shape
             _, cpu_page_size = cpu_tensor.shape
-            assert cpu_page_size == gpu_page_size * block_size_factor
+            assert cpu_page_size % block_size_factor == 0
+            tensor_group = (tensor_to_group or {}).get(tensor_idx)
+            if tensor_group is not None:
+                max_ref_page_size = max(
+                    ref.page_size_bytes
+                    for ref in kv_cache_groups_data_refs[tensor_group]
+                )
+                assert cpu_page_size >= max_ref_page_size * block_size_factor
 
         self.src_tensors: list[torch.Tensor] = (
             gpu_tensors if gpu_to_cpu else cpu_tensors
@@ -727,7 +736,26 @@ class CpuGpuOffloadingHandlers:
                 gpu_tensor = kv_cache_tensor.tensor.view(torch.int8).view(
                     (-1, gpu_page_size_bytes)
                 )
-                cpu_page_size_bytes = gpu_page_size_bytes * block_size_factor
+                tensor_refs = [
+                    ref
+                    for refs in kv_caches.group_data_refs
+                    for ref in refs
+                    if ref.tensor_idx == tensor_idx
+                ]
+                ref_page_size_bytes = max(
+                    (ref.page_size_bytes for ref in tensor_refs),
+                    default=gpu_page_size_bytes,
+                )
+                cpu_page_size_bytes = ref_page_size_bytes * block_size_factor
+                logger.info(
+                    "CPU tensor %d: gpu page %d B (padded), cpu page %d B, "
+                    "refs %d page %d B",
+                    tensor_idx,
+                    gpu_page_size_bytes,
+                    cpu_page_size_bytes,
+                    len(tensor_refs),
+                    ref_page_size_bytes,
+                )
 
                 tensor_region = tensor_regions.get(tensor_idx, mmap_region)
                 if tensor_region is not None:
