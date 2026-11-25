@@ -34,26 +34,19 @@ def mamba_state_slots(
     mamba_spec: MambaSpec,
     retention_interval: int | None,
     reference_tokens: int,
-    chain_slots: int = 0,
 ) -> int:
     """Recurrent-state slots needed alongside ``num_token_blocks`` token slots.
 
-    A state is readable only together with the whole attention chain below it,
-    and a request resumes from exactly one position: the end of its prompt. So
-    the pool needs **one slot per cached chain**, not one slot per retention
-    boundary of a reference-length request: every boundary but the last one of
-    a chain is unreadable by construction, because a prefix hit is the minimum
-    over all groups and the attention below the boundary has to be present too.
-    Sizing by the retention grid gave 44 state slots (51.6% of the 16 GiB tier)
-    for two reference-length requests while the token pool held 1.4 of them, so
-    half the tier held states nothing could ever be restored from.
-
-    ``chain_slots`` is the number of chains the tier is expected to hold; two
-    slots of slack cover a chain whose endpoint moves between steps and one
-    shared-prefix junction.
+    The host tier keeps one snapshot per retention segment, because that is the
+    grid the GPU prefix cache keeps and the only grid a continuation can resume
+    from. So the state pool is sized in proportion to the token pool: one slot
+    per ``retention_interval // block_size`` token slots. The absolute number
+    follows from the budget, which is solved against both pools together, so no
+    separate arithmetic on request counts or chain counts decides the split.
     """
-    if chain_slots > 0:
-        return min(num_token_blocks, max(2, chain_slots) + 2)
+    if retention_interval:
+        per_segment = max(1, retention_interval // block_size)
+        return min(num_token_blocks, max(2, cdiv(num_token_blocks, per_segment)))
     if retention_interval is None:
         return num_token_blocks
     blocks_per_request = max(1, cdiv(reference_tokens, block_size))
@@ -142,14 +135,6 @@ class CPUOffloadingSpec(OffloadingSpec):
         )
         if self.state_slots_reference_tokens <= 0:
             raise ValueError("mamba_state_slots_reference_tokens must be positive")
-        # Chains, not retention boundaries, are what the state pool holds (see
-        # mamba_state_slots). The default follows the scheduler's own width plus
-        # two: every concurrent sequence keeps one resume point, and two spare
-        # slots absorb the endpoint moving between steps.
-        self.chain_slots = int(
-            os.environ.get("VLLM_TIER_CHAIN_SLOTS", "0")
-        ) or (vllm_config.scheduler_config.max_num_seqs + 2)
-
         self.cpu_group_page_sizes: dict[int, int] = {}
         self.cpu_group_num_blocks: dict[int, int] = {}
         # Group indices backed by a MambaSpec (state, not attention KV).
@@ -214,7 +199,6 @@ class CPUOffloadingSpec(OffloadingSpec):
                     mamba_spec,
                     self.retention_interval,
                     self.state_slots_reference_tokens,
-                    self.chain_slots,
                 )
 
             def bytes_per_worker(num_token_blocks: int) -> int:

@@ -1309,10 +1309,6 @@ class MambaManager(SingleTypeKVCacheManager):
             # Usually one entry; under async scheduling a second one can be
             # pending because the previous step has not been processed yet.
             self.last_state_block_idx: dict[str, list[int]] = {}
-            # Requests whose prompt-boundary state has already been offered to
-            # the host tier. A request can resume only from the boundary its
-            # prompt ends on, so one offer per request is all that is useful.
-            self._prompt_state_done: set[str] = set()
             # The set of the requests that have been allocated blocks
             self._allocated_block_reqs: set[str] = set()
 
@@ -1580,7 +1576,6 @@ class MambaManager(SingleTypeKVCacheManager):
         if self.mamba_cache_mode == "align":
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
-            self._prompt_state_done.discard(request_id)
             # A hand-off is valid only while its source still belongs to this
             # request. Drop offers that have not reached the connector before
             # returning the request's blocks to the pool.
@@ -1713,24 +1708,14 @@ class MambaManager(SingleTypeKVCacheManager):
             if mask is not None and not mask[block_idx - num_cached_blocks_before]:
                 continue
             if self.mamba_cache_mode == "align":
-                # A state slot is worth one boundary: the one a later request
-                # resumes from. With EAGLE/MTP that is one page before the
-                # prompt end (the engine recomputes the final matched page), so
-                # hand off the last real state at or before that page. Handing
-                # off the prompt-end state instead stores a position the load
-                # path never looks at: it sits one page past the shifted
-                # window, and every continuation misses it and recomputes the
-                # whole prompt from the CPU tier.
-                checkpoint = max(
-                    cdiv(request.num_prompt_tokens, self.block_size) - 2, 0
-                )
-                if (
-                    num_tokens < (checkpoint + 1) * self.block_size
-                    or block_idx > checkpoint
-                    or request.request_id in self._prompt_state_done
-                ):
-                    continue
-                self._prompt_state_done.add(request.request_id)
+                # Every retention grid point the mask kept gets its state handed
+                # off: the host tier has to hold a snapshot each
+                # ``prefix_cache_retention_interval`` tokens, so whichever
+                # boundary a continuation lands on is present. Offering only
+                # the prompt-end state (or a single point per request) leaves
+                # the continuation looking at a boundary that was never stored;
+                # the pools then evict the one state they have and every turn
+                # restarts from the shared system prefix.
                 self._pending_boundary_state_offloads.append(
                     (
                         request.request_id,

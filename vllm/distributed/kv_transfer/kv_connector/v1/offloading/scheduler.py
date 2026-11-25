@@ -459,7 +459,10 @@ class OffloadingConnectorScheduler:
         self._boundary_lost: dict[int, int] = {}
         # A held-back hand-off pins the request's source block, so the queue of
         # held offers is bounded per request: keep the newest, drop the oldest.
-        self._max_pending_boundary_offloads = 8
+        # One prompt offers a hand-off per retention boundary it crosses, so
+        # the cap has to cover the boundaries of a long prompt (168k tokens at
+        # an 8192 grid is 21) plus offers deferred from earlier steps.
+        self._max_pending_boundary_offloads = 64
 
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
