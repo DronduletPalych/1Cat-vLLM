@@ -135,6 +135,9 @@ class SchedulerOffloadConfig(NamedTuple):
     num_kv_cache_groups: int
     # See OffloadingSpec.demote_superseded_states.
     demote_superseded_states: bool = True
+    # CacheConfig.prefix_cache_retention_interval: the only token grid on which
+    # the core keeps Mamba ``align`` checkpoints. None means dense (every block).
+    retention_interval: int | None = None
 
     @classmethod
     def from_spec(cls, spec: OffloadingSpec) -> "SchedulerOffloadConfig":
@@ -240,6 +243,7 @@ class SchedulerOffloadConfig(NamedTuple):
             offload_prompt_only=spec.offload_prompt_only,
             num_kv_cache_groups=len(spec.kv_cache_config.kv_cache_groups),
             demote_superseded_states=getattr(spec, "demote_superseded_states", True),
+            retention_interval=retention_interval,
         )
 
 
@@ -452,6 +456,7 @@ class OffloadingConnectorScheduler:
             "retrycap": 0,
             "superseded": 0,
             "beyond_policy": 0,
+            "off_grid": 0,
         }
         # Boundary offers dropped for good, per group: the queue cap evicted
         # them, the offer can never be addressed, or the request ended with the
@@ -1503,6 +1508,24 @@ class OffloadingConnectorScheduler:
                     self._boundary_skips["retrycap"] += 1
                     self._boundary_skips["beyond_policy"] += 1
                     continue
+                # Sparse retention keeps a Mamba ``align`` checkpoint only on
+                # the retention grid; the core still hands off a state at every
+                # decode block. An off-grid state costs a state slot, but the
+                # load path can only ask for a grid page, so it evicts the page
+                # a continuation actually needs. Keep the grid and the one
+                # prompt-end page, which is the shortest reachable checkpoint.
+                retention = self.config.retention_interval
+                if (
+                    retention
+                    and group_config.requires_exact_boundary_source
+                    and boundary_tokens % retention != 0
+                    and boundary_tokens
+                    != req.num_prompt_tokens
+                    // group_config.offloaded_block_size
+                    * group_config.offloaded_block_size
+                ):
+                    self._boundary_skips["off_grid"] += 1
+                    continue
                 by_boundary.setdefault(boundary_tokens, []).append(entry)
 
             # One CPU page holds every KV group of a token block, so all groups
@@ -1879,7 +1902,8 @@ class OffloadingConnectorScheduler:
                 "OFFLOAD-DEFER deferred_stores=%d deferred_promotions=%d "
                 "store_cannot_proceed=%d store_deferred=%d pinned_blocks=%d "
                 "inflight_jobs=%d boundary_pre=%d boundary_skip_not_ready=%d "
-                "boundary_skip_busy=%d boundary_skip_retrycap=%d",
+                "boundary_skip_busy=%d boundary_skip_retrycap=%d "
+                "boundary_skip_off_grid=%d",
                 st["deferred_stores"],
                 st["deferred_promotions"],
                 st["store_cannot_proceed"],
@@ -1890,6 +1914,7 @@ class OffloadingConnectorScheduler:
                 self._boundary_skips["not_ready"],
                 self._boundary_skips["busy"],
                 self._boundary_skips["retrycap"],
+                self._boundary_skips["off_grid"],
             )
             self._log_hit_split()
         for event in self.manager.take_events():
