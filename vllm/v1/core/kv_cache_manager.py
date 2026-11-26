@@ -1109,8 +1109,13 @@ class KVCacheManager:
         )
 
         if full_sequence_must_fit:
-            # First check and fail if the full request sequence won't fit.
-            full_num_tokens = min(request.num_tokens, self.max_model_len)
+            # First check and fail if the full request sequence (prompt +
+            # max output) won't fit. Reserving the output growth, not just
+            # the prompt, keeps the pool from reaching 100% under concurrent
+            # long contexts.
+            full_num_tokens = min(
+                request.num_tokens + request.max_tokens, self.max_model_len
+            )
 
             num_blocks_to_allocate, full_group_demand = (
                 self.coordinator.get_group_blocks_to_allocate(
