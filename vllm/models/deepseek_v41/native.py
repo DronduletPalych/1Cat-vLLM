@@ -231,8 +231,81 @@ def gate_route(gate, x, top_k, scale):
 # TP4 one-shot push all-reduce (v41sk.ll_allreduce) for small FP16/FP32
 # payloads: no barriers, the receive slots carry a sentinel. Default off.
 _LL_AR = envs.VLLM_V41_LL_AR == "1"
-_LL_CAP = 1024 * 1024
+_LL_CAP = int(envs.VLLM_V41_LL_CAP)
 _LL_STATE: list = []
+_LL_MARKOV_CAP = 4096
+_LL_MARKOV_STATE: list = []
+_LL_DCP_MAX_T = 384
+_LL_DCP_SLOT_CAP = _LL_DCP_MAX_T * 16 * (512 * 2 + 65 * 16)
+_LL_DCP_STATE: list = []
+
+
+def _ll_dcp_state():
+    """Dedicated TP4 NVLink P2P buffer for fused DCP=4 Q push + OML combine."""
+    if not _LL_DCP_STATE:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        import torch.distributed as dist
+
+        from vllm import _custom_ops as ops
+        from vllm.distributed import get_tp_group
+
+        group = get_tp_group()
+        if group.world_size != 4:
+            _LL_DCP_STATE.append(None)
+            return None
+        load_v41sk()
+        size = 2 * 4 * _LL_DCP_SLOT_CAP
+        pointer, handle = ops.allocate_shared_buffer_and_handle(size)
+        torch.ops.v41sk.ll_arm(pointer, size)
+        sample = torch.empty(1, dtype=torch.float16, device="cuda")
+        torch.ops.v41sk.dcp_fused_warmup(sample)
+        torch.accelerator.synchronize()
+        handles = [None] * 4
+        dist.all_gather_object(handles, handle, group=group.cpu_group)
+        rank = group.rank_in_group
+        ptrs = [
+            pointer if i == rank else ops.open_mem_handle(h)
+            for i, h in enumerate(handles)
+        ]
+        dist.barrier(group=group.cpu_group)
+        dcp_cnt = torch.zeros(_LL_DCP_MAX_T * 16, dtype=torch.int32, device="cuda")
+        _LL_DCP_STATE.append((ptrs, rank, _LL_DCP_SLOT_CAP, dcp_cnt))
+        logger.info(
+            "V4.1 native: TP4 fused DCP=4 P2P buffer (%d KiB/slot, max T=%d)",
+            _LL_DCP_SLOT_CAP // 1024,
+            _LL_DCP_MAX_T,
+        )
+    return _LL_DCP_STATE[0]
+
+
+def _ll_markov_state():
+    """Dedicated 4 KiB/slot TP4 NVLink buffer for 5-step fused Markov."""
+    if not _LL_MARKOV_STATE:
+        import torch.distributed as dist
+
+        from vllm import _custom_ops as ops
+        from vllm.distributed import get_tp_group
+
+        group = get_tp_group()
+        if group.world_size != 4:
+            _LL_MARKOV_STATE.append(None)
+            return None
+        load_v41sk()
+        size = 2 * 4 * _LL_MARKOV_CAP
+        pointer, handle = ops.allocate_shared_buffer_and_handle(size)
+        torch.ops.v41sk.ll_arm(pointer, size)
+        torch.accelerator.synchronize()
+        handles = [None] * 4
+        dist.all_gather_object(handles, handle, group=group.cpu_group)
+        rank = group.rank_in_group
+        ptrs = [
+            pointer if i == rank else ops.open_mem_handle(h)
+            for i, h in enumerate(handles)
+        ]
+        dist.barrier(group.cpu_group)
+        _LL_MARKOV_STATE.append((ptrs, rank, _LL_MARKOV_CAP))
+    return _LL_MARKOV_STATE[0]
 
 
 def _ll_state():
@@ -310,6 +383,36 @@ def tp_all_gather(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
             torch.ops.v41sk.ll_allgather(out, x, *ptrs, rank, _LL_CAP, counter)
             return out
     return tensor_model_parallel_all_gather(x, dim)
+
+
+def tp_all_to_all(x: torch.Tensor) -> torch.Tensor:
+    """TP4 [4, ...] all-to-all on the one-shot push slots, else NCCL."""
+    import torch.distributed as dist
+
+    from vllm.distributed import get_tp_group
+
+    x = x.contiguous()
+    assert x.shape[0] == 4
+    slice_bytes = (x.numel() // 4) * x.element_size()
+    if (
+        _LL_AR
+        and x.is_cuda
+        and x.dtype in (torch.float16, torch.float32)
+        and slice_bytes > 0
+        and slice_bytes <= _LL_CAP
+        and slice_bytes % 16 == 0
+    ):
+        state = _ll_state()
+        if state is not None:
+            ptrs, rank, counter = state
+            out = torch.empty_like(x)
+            torch.ops.v41sk.ll_alltoall(
+                out.view(4, -1), x.view(4, -1), *ptrs, rank, _LL_CAP, counter
+            )
+            return out
+    out = torch.empty_like(x)
+    dist.all_to_all_single(out, x, group=get_tp_group().device_group)
+    return out
 
 
 # Checkpoint dense projections stored as FP8 E4M3 with 32x32 UE8M0 scales.

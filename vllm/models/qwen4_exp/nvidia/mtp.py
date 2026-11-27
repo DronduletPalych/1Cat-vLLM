@@ -277,8 +277,8 @@ def _mtp_fp8_experts_supported(
 def _make_draft_vllm_config(
     vllm_config: VllmConfig,
     mtp_start_layer_idx: int,
-) -> VllmConfig:
-    """Ensure that the draft model config is set in the vLLM config."""
+) -> tuple[VllmConfig, set[str]]:
+    """Return the draft config and the checkpoint FP8 expert prefixes."""
     speculative_config = vllm_config.speculative_config
     if speculative_config is None or speculative_config.draft_model_config is None:
         raise ValueError("speculative_config.draft_model_config must be set")
@@ -382,7 +382,7 @@ def _make_draft_vllm_config(
             )
         draft_quant_config = MTPQ80Config(draft_quant_config)
     draft_vllm_config.quant_config = draft_quant_config
-    return draft_vllm_config
+    return draft_vllm_config, checkpoint_prefixes
 
 
 @support_torch_compile(
@@ -423,16 +423,14 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             if share_target_embed_tokens
             else VocabParallelEmbedding(self.vocab_size, self.hidden_size)
         )
-        draft_vllm_config = _make_draft_vllm_config(
+        draft_vllm_config, checkpoint_prefixes = _make_draft_vllm_config(
             vllm_config,
             self.mtp_start_layer_idx,
         )
         self.fp8_mtp_checkpoint_prefixes = {
             f"model.layers.{int(name.split('.')[2]) - self.mtp_start_layer_idx}"
             ".mlp.experts"
-            for name in getattr(
-                draft_vllm_config.quant_config, "checkpoint_prefixes", ()
-            )
+            for name in checkpoint_prefixes
         }
         self.fp8_mtp_tp_size = draft_vllm_config.parallel_config.tensor_parallel_size
         # Phase 2: the drafter shares the target cache_config; remember the main
@@ -641,6 +639,217 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             ]
         return sample_hidden_states, multi_hidden
 
+    def _combine_fc_eager(
+        self, inputs_embeds: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        from .ops.hc import grouped_gemma_rmsnorm
+        from .sm70_mtp_fc import maybe_combine_fc
+
+        combined = maybe_combine_fc(
+            self, inputs_embeds, hidden_states, allow_eager=True
+        )
+        if combined is not None:
+            return combined
+        num_tokens = hidden_states.shape[0]
+        if (
+            num_tokens >= 64
+            and inputs_embeds.is_cuda
+            and inputs_embeds.dtype == hidden_states.dtype == torch.float16
+        ):
+            inputs_embeds = grouped_gemma_rmsnorm(
+                inputs_embeds.contiguous(),
+                self.pre_fc_norm_embedding.weight,
+                self.pre_fc_norm_embedding.variance_epsilon,
+                1,
+            )
+            inputs_embeds = self.fc_embedding(inputs_embeds)
+            hidden_states = grouped_gemma_rmsnorm(
+                hidden_states.contiguous(),
+                self.pre_fc_norm_hidden.weight,
+                self.pre_fc_norm_hidden.variance_epsilon,
+                self.hc_count,
+            ).view(num_tokens, self.hc_count, self.hidden_size)
+            hidden_states = self.fc_hidden(hidden_states)
+            hidden_states = inputs_embeds.unsqueeze(-2) + hidden_states
+            return hidden_states.flatten(-2)
+        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+        inputs_embeds = self.fc_embedding(inputs_embeds)
+        hidden_states = hidden_states.view(num_tokens, self.hc_count, self.hidden_size)
+        hidden_states = self.pre_fc_norm_hidden(hidden_states.flatten(-2)).view(
+            num_tokens, self.hc_count, self.hidden_size
+        )
+        hidden_states = self.fc_hidden(hidden_states)
+        hidden_states = inputs_embeds.unsqueeze(-2) + hidden_states
+        return hidden_states.flatten(-2)
+
+    def can_prefill_shortcut(self) -> bool:
+        if self.num_mtp_layers != 1:
+            return False
+        layer = self.layers[0]
+        return bool(
+            layer.ple is None
+            and layer.layer_type == "full_attention"
+            and hasattr(layer.self_attn, "forward_kv_only")
+        )
+
+    def _combine_fc_sequence_rows_chunked(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        row_indices: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        num_tokens = input_ids.shape[0]
+        tp = get_tp_group()
+        rk = tp.rank_in_group
+        local_rows = (num_tokens + 3) // 4
+        r_lo = rk * local_rows
+        r_hi = min(num_tokens, (rk + 1) * local_rows)
+        combined_loc = hidden_states.new_zeros(
+            (local_rows, self.hc_count * self.hidden_size)
+        )
+        hidden_sel = None
+        if row_indices is not None:
+            emb_sel = self.embed_input_ids(input_ids.index_select(0, row_indices))
+            hidden_sel = self._combine_fc_eager(
+                emb_sel, hidden_states.index_select(0, row_indices)
+            )
+            del emb_sel
+        chunk_sz = 4096
+        for c0 in range(0, num_tokens, chunk_sz):
+            c1 = min(num_tokens, c0 + chunk_sz)
+            emb_c = self.embed_input_ids(input_ids[c0:c1])
+            comb_c = self._combine_fc_eager(emb_c, hidden_states[c0:c1])
+            o0 = max(c0, r_lo)
+            o1 = min(c1, r_hi)
+            if o0 < o1:
+                combined_loc[o0 - r_lo : o1 - r_lo].copy_(comb_c[o0 - c0 : o1 - c0])
+            del emb_c, comb_c
+        return combined_loc, hidden_sel
+
+    def forward_kv_only(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> bool:
+        if not self.can_prefill_shortcut():
+            return False
+        layer = self.layers[0]
+        num_tokens = input_ids.shape[0]
+        if num_tokens >= 320 and get_tp_group().world_size == 4:
+            from .sm70_hc_prefill_peer import (
+                hc_sequence_allgather_rows,
+                hc_sequence_shard_rows,
+            )
+
+            if num_tokens >= 4096:
+                combined_loc, _ = self._combine_fc_sequence_rows_chunked(
+                    input_ids, hidden_states
+                )
+            else:
+                inputs_embeds = self.embed_input_ids(input_ids)
+                combined_hidden = self._combine_fc_eager(inputs_embeds, hidden_states)
+                combined_loc = hc_sequence_shard_rows(combined_hidden)
+                del combined_hidden
+            if hasattr(layer.attn_hyper_connection, "hc_shard_down"):
+                _, block_input, _ = layer.attn_hyper_connection.sequence_parallel_mix(
+                    combined_loc
+                )
+                block_input = block_input[:num_tokens]
+            else:
+                _, local_block, _ = layer.attn_hyper_connection.mix(combined_loc)
+                block_input = hc_sequence_allgather_rows(local_block, num_tokens)
+            del combined_loc
+        else:
+            inputs_embeds = self.embed_input_ids(input_ids)
+            combined_hidden = self._combine_fc_eager(inputs_embeds, hidden_states)
+            _, block_input, _ = layer.attn_hyper_connection.mix(combined_hidden)
+        layer.self_attn.forward_kv_only(positions=positions, hidden_states=block_input)
+        return True
+
+    def forward_last_rows(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        row_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if not self.can_prefill_shortcut():
+            return None
+        layer = self.layers[0]
+        if not hasattr(layer.self_attn, "forward_last_rows"):
+            return None
+        from .model import Qwen4ExpSparseMoeBlock
+
+        num_tokens = input_ids.shape[0]
+        hidden_sel_pre: torch.Tensor | None = None
+        combined_hidden: torch.Tensor | None = None
+        if num_tokens >= 320 and get_tp_group().world_size == 4:
+            from .sm70_hc_prefill_peer import (
+                hc_sequence_allgather_rows,
+                hc_sequence_shard_rows,
+            )
+
+            if num_tokens >= 4096:
+                combined_loc, hidden_sel_pre = self._combine_fc_sequence_rows_chunked(
+                    input_ids, hidden_states, row_indices=row_indices
+                )
+            else:
+                inputs_embeds = self.embed_input_ids(input_ids)
+                combined_hidden = self._combine_fc_eager(inputs_embeds, hidden_states)
+                combined_loc = hc_sequence_shard_rows(combined_hidden)
+            if hasattr(layer.attn_hyper_connection, "hc_shard_down"):
+                _, block_input, local_inj = (
+                    layer.attn_hyper_connection.sequence_parallel_mix(combined_loc)
+                )
+                block_input = block_input[:num_tokens]
+            else:
+                _, local_block, local_inj = layer.attn_hyper_connection.mix(
+                    combined_loc
+                )
+                block_input = hc_sequence_allgather_rows(local_block, num_tokens)
+            del combined_loc
+            injection = hc_sequence_allgather_rows(local_inj, num_tokens)
+        else:
+            inputs_embeds = self.embed_input_ids(input_ids)
+            combined_hidden = self._combine_fc_eager(inputs_embeds, hidden_states)
+            combined_hidden, block_input, injection = layer.attn_hyper_connection.mix(
+                combined_hidden
+            )
+        attn_out_sel = layer.self_attn.forward_last_rows(
+            positions=positions,
+            hidden_states=block_input,
+            row_indices=row_indices,
+        )
+        if attn_out_sel is None:
+            return None
+        if hidden_sel_pre is not None:
+            hidden_sel = hidden_sel_pre
+        else:
+            assert combined_hidden is not None
+            hidden_sel = combined_hidden.index_select(0, row_indices)
+        inj_sel = injection.index_select(0, row_indices)
+        hidden_sel, block_in_sel, inj_sel = layer.mlp_hyper_connection.combine_and_mix(
+            hidden_sel, attn_out_sel, inj_sel
+        )
+        mlp_out_sel = (
+            layer.mlp.forward_partials(block_in_sel)
+            if (
+                isinstance(layer.mlp, Qwen4ExpSparseMoeBlock)
+                and getattr(layer.mlp_hyper_connection, "_partial_inputs", False)
+                and not getattr(
+                    getattr(layer.mlp.experts, "runner", None),
+                    "_fused_output_is_reduced",
+                    False,
+                )
+            )
+            else layer.mlp(block_in_sel)
+        )
+        multi_sel, sample_sel, _ = self.hyper_connection_mixer.combine_and_mix(
+            hidden_sel, mlp_out_sel, inj_sel
+        )
+        return sample_sel, multi_sel
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         weights = maybe_fuse_shared_experts(
             weights,
@@ -745,13 +954,11 @@ class _Qwen4ExpMTPPrefillSequenceModel(nn.Module):
     },
 )
 class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
-    # Qwen4Exp repacks the small BF16/shared/MTP tensors separately from the
-    # target experts and PLE tables. Loading the standalone drafter from that
-    # compact shard set avoids scanning the full target checkpoint a second
-    # time. The remaining patterns preserve compatibility with conventional
-    # Hugging Face checkpoint layouts.
+    # A BF16-named shard may contain only KV scales, with the MTP body in
+    # ordinary shards. Select the full checkpoint, including compact BF16
+    # layouts; skip_checkpoint_weight filters target tensors before reading
+    # them in the standard mapped/direct safetensors iterator.
     allow_patterns_overrides = [
-        "model-bf16-*.safetensors",
         "*.safetensors",
         "*.bin",
         "*.pt",
@@ -881,7 +1088,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
     def _use_hc_prefill_sequence_rows(self, positions, hidden_states, intermediate):
         return bool(
             getattr(self, "_hc_prefill_sequence_qualified", False)
-            and 4096 <= positions.shape[-1] <= 16384
+            and 320 <= positions.shape[-1] <= 16384
             and hidden_states is not None
             and hidden_states.dtype == torch.float16
             and hidden_states.shape == (positions.shape[-1], 10240)
@@ -954,6 +1161,25 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         from .sm70_hcx import hc_prefill_sequence_parallel_context
 
         return hc_prefill_sequence_parallel_context(False)
+
+    def forward_kv_only(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> bool:
+        return self.model.forward_kv_only(input_ids, positions, hidden_states)
+
+    def forward_last_rows(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        row_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        return self.model.forward_last_rows(
+            input_ids, positions, hidden_states, row_indices
+        )
 
     def compute_logits(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0

@@ -261,7 +261,7 @@ from .utils import (
     KVBlockZeroer,
     add_kv_sharing_layers_to_kv_cache_groups,
     bind_kv_cache,
-    compressed_kernel_block_size,
+    kv_cache_view_page_rows,
     prepare_kernel_block_sizes,
     sanity_check_mm_encoder_outputs,
 )
@@ -352,42 +352,104 @@ def _dflash_ddtree_trace_event(
         logger.exception("Failed to write DDTree trace event to %s", trace_path)
 
 
+_CLIP_ARANGE_CACHE: dict[tuple[torch.device, int], torch.Tensor] = {}
+_CLIP_STOPS_CACHE: dict[tuple[torch.device, tuple[int, ...]], torch.Tensor] = {}
+
+
 def _clip_stateful_sample_limits(
     output_token_ids, req_ids, requests, output_budget=None
 ):
     """Keep stop/length clipping on device before a private-state commit.
 
-    The normal CPU output processor also applies these limits. Models with
-    prefix snapshots need the same boundary before an asynchronous next step
-    consumes the sampled-count selector. Other models retain their old path.
+    Vectorized 2D implementation: replaces O(R) per-request Python loops
+    (~264 eager CUDA launches / 2.6 ms at R=16) with 4-5 batched 2D ops (~30 us).
     """
-    for row, req_id in enumerate(req_ids[: output_token_ids.shape[0]]):
-        request = requests.get(req_id)
+    rows = min(len(req_ids), output_token_ids.shape[0])
+    if rows == 0:
+        return
+    width = output_token_ids.shape[1]
+    device = output_token_ids.device
+    vals = output_token_ids[:rows]
+
+    # Collect per-row sampling params once on CPU.
+    has_any_max = False
+    all_have_max = True
+    rem_list: list[int] | None = None if output_budget is not None else []
+    no_max_rows = []
+    row_stops: list[tuple[int, ...]] = []
+    has_any_stop = False
+    for row in range(rows):
+        request = requests.get(req_ids[row])
         params = None if request is None else request.sampling_params
         if params is None:
+            all_have_max = False
+            no_max_rows.append(row)
+            if rem_list is not None:
+                rem_list.append(width)
+            row_stops.append(())
             continue
         if params.max_tokens is not None:
-            if output_budget is not None:
-                positions = torch.arange(
-                    output_token_ids.shape[1], device=output_token_ids.device
+            has_any_max = True
+            if rem_list is not None:
+                rem_list.append(
+                    max(0, params.max_tokens - len(request.output_token_ids))
                 )
-                output_token_ids[row].masked_fill_(positions >= output_budget[row], -1)
+        else:
+            all_have_max = False
+            no_max_rows.append(row)
+            if rem_list is not None:
+                rem_list.append(width)
+        if width > 1:
+            stops = set(params.stop_token_ids or ())
+            if not params.ignore_eos and params.eos_token_id is not None:
+                stops.add(params.eos_token_id)
+            if stops:
+                has_any_stop = True
+                row_stops.append(tuple(sorted(stops)))
             else:
-                remaining = max(0, params.max_tokens - len(request.output_token_ids))
-                output_token_ids[row, remaining:].fill_(-1)
-        if output_token_ids.shape[1] <= 1:
-            continue
-        stops = set(params.stop_token_ids or ())
-        if not params.ignore_eos and params.eos_token_id is not None:
-            stops.add(params.eos_token_id)
-        if stops:
-            values = output_token_ids[row]
-            stop = torch.zeros_like(values, dtype=torch.bool)
-            for token_id in stops:
-                stop |= values == token_id
-            # Include the first stop itself, excluding every later candidate.
-            after = stop.to(torch.int32).cumsum(0) - stop.to(torch.int32) > 0
-            values.masked_fill_(after, -1)
+                row_stops.append(())
+        else:
+            row_stops.append(())
+
+    if has_any_max:
+        pos_key = (device, width)
+        positions = _CLIP_ARANGE_CACHE.get(pos_key)
+        if positions is None:
+            positions = _CLIP_ARANGE_CACHE[pos_key] = torch.arange(
+                width, dtype=torch.int64, device=device
+            )
+        if output_budget is not None:
+            b = output_budget[:rows]
+            if not all_have_max:
+                b = b.clone()
+                b[no_max_rows] = width
+        else:
+            b = torch.tensor(rem_list, dtype=torch.int64, device=device)
+        vals.masked_fill_(positions.unsqueeze(0) >= b.unsqueeze(1), -1)
+
+    if width <= 1 or not has_any_stop:
+        return
+
+    first = row_stops[0]
+    if all(s == first for s in row_stops):
+        if len(first) == 1:
+            stop = vals == first[0]
+        else:
+            st_key = (device, first)
+            st_t = _CLIP_STOPS_CACHE.get(st_key)
+            if st_t is None:
+                st_t = _CLIP_STOPS_CACHE[st_key] = torch.tensor(
+                    first, dtype=vals.dtype, device=device
+                )
+            stop = (vals.unsqueeze(-1) == st_t).any(dim=-1)
+    else:
+        max_ns = max(len(s) for s in row_stops)
+        padded = [list(s) + [-2] * (max_ns - len(s)) for s in row_stops]
+        st_t = torch.tensor(padded, dtype=vals.dtype, device=device)
+        stop = (vals.unsqueeze(-1) == st_t.unsqueeze(1)).any(dim=-1)
+    s32 = stop.to(torch.int32)
+    after = s32.cumsum(dim=1) - s32 > 0
+    vals.masked_fill_(after, -1)
 
 
 def _v41_fused_clip_count(runner, output_token_ids, batch):
@@ -5792,12 +5854,24 @@ class GPUModelRunner(
         ):
             prefix_anchor_lens = num_prompt_tokens_cpu
 
+        block_table_cpu_gid_0 = (
+            self.input_batch.block_table[0].block_table.np[:num_reqs]
+            if (
+                seq_lens_cpu is not None
+                and num_reqs == num_reqs_padded
+                and not isinstance(
+                    kv_cache_groups[0].kv_cache_spec, EncoderOnlyAttentionSpec
+                )
+            )
+            else None
+        )
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
             seq_lens=self.seq_lens[:num_reqs_padded],
             _seq_lens_cpu=seq_lens_cpu,
             _num_computed_tokens_cpu=num_computed_tokens_cpu,
+            _block_table_cpu=block_table_cpu_gid_0,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             num_reqs=num_reqs_padded,
             num_actual_tokens=num_tokens_padded,
@@ -6036,6 +6110,17 @@ class GPUModelRunner(
             if kv_cache_gid > 0:
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
+                cm._block_table_cpu = (
+                    self.input_batch.block_table[kv_cache_gid].block_table.np[:num_reqs]
+                    if (
+                        seq_lens_cpu is not None
+                        and num_reqs == num_reqs_padded
+                        and not isinstance(
+                            kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec
+                        )
+                    )
+                    else None
+                )
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(
@@ -7563,8 +7648,25 @@ class GPUModelRunner(
         # The buffer can be replaced (grown), so its address is part of the key.
         state = (buffer.data_ptr(), keys)
         if keys and state != getattr(self, "_coupled_keys_state", None):
-            staged = torch.tensor(keys, dtype=torch.int64).pin_memory()
-            buffer[:num_reqs].copy_(staged, non_blocking=True)
+            ring = getattr(self, "_coupled_keys_ring", None)
+            if ring is None or ring[0][0].numel() < self.max_num_reqs:
+                ring = [
+                    (
+                        torch.zeros(
+                            self.max_num_reqs, dtype=torch.int64, pin_memory=True
+                        ),
+                        torch.cuda.Event(),
+                    )
+                    for _ in range(8)
+                ]
+                self._coupled_keys_ring = ring
+                self._coupled_keys_turn = 0
+            staged, uploaded = ring[self._coupled_keys_turn]
+            self._coupled_keys_turn = (self._coupled_keys_turn + 1) % len(ring)
+            uploaded.synchronize()
+            staged[:num_reqs].copy_(torch.tensor(keys, dtype=torch.int64))
+            buffer[:num_reqs].copy_(staged[:num_reqs], non_blocking=True)
+            uploaded.record()
             self._coupled_keys_state = state
 
     def _set_coupled_rows(
@@ -7662,11 +7764,38 @@ class GPUModelRunner(
         ):
             from vllm.models.deepseek_v41.greedy_head import verify_top_tokens
 
-            top_tokens = self.model.get_v41_top_tokens(sample_hidden_states)
+            if sampling_metadata.all_greedy:
+                top_tokens = self.model.get_v41_top_tokens(sample_hidden_states)
+            else:
+                from vllm.v1.sample.rejection_sampler import expand_batch_to_tokens
+                from vllm.v1.spec_decode import coupled_draw
+
+                assert spec_decode_metadata is not None
+                assert sampling_metadata.temperature is not None
+                num_reqs = len(spec_decode_metadata.num_draft_tokens)
+                num_rows = sample_hidden_states.shape[0]
+                k_buf = coupled_draw.keys_buffer(self.device, self.max_num_reqs)
+                row_temps = expand_batch_to_tokens(
+                    sampling_metadata.temperature,
+                    spec_decode_metadata.cu_num_sampled_tokens,
+                    num_rows,
+                )
+                row_keys = expand_batch_to_tokens(
+                    k_buf[:num_reqs],
+                    spec_decode_metadata.cu_num_sampled_tokens,
+                    num_rows,
+                )
+                row_pos = self.positions[spec_decode_metadata.logits_indices.long()] + 1
+                top_tokens = self.model.get_v41_top_tokens(
+                    sample_hidden_states,
+                    temperatures=row_temps,
+                    keys=row_keys,
+                    positions=row_pos,
+                )
             sampled = verify_top_tokens(
                 top_tokens, spec_decode_metadata, self.model_config.get_vocab_size()
             )
-            logger.info_once("V4.1 TP-local greedy verification enabled")
+            logger.info_once("V4.1 TP-local greedy/coupled verification enabled")
             return SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
 
         spec_config = self.speculative_config
@@ -10702,11 +10831,33 @@ class GPUModelRunner(
         }
         for i, h in enumerate(aux_hidden_states):
             inputs[f"aux{i}"] = h[: cad.num_actual_tokens]
+        use_coupled = (
+            _COUPLED_DRAFTS
+            and sampling_metadata is not None
+            and not sampling_metadata.all_greedy
+            and sampling_metadata.temperature is not None
+        )
+        if use_coupled:
+            from vllm.v1.spec_decode import coupled_draw
+
+            self._fill_coupled_keys()
+            inputs["ckeys"] = coupled_draw.keys_buffer(self.device, self.max_num_reqs)[
+                : cad.num_reqs
+            ]
+            inputs["ctemp"] = sampling_metadata.temperature[: cad.num_reqs]
 
         # The DSpark proposer (VLLM_V41_PROPOSE_GRAPH is only used with it).
         drafter: Any = self.drafter
 
         def round_fn(d: dict[str, torch.Tensor]) -> torch.Tensor:
+            if "ckeys" in d:
+                from vllm.v1.spec_decode import coupled_draw
+
+                kbuf = coupled_draw.keys_buffer(self.device, self.max_num_reqs)
+                kbuf[: d["ckeys"].shape[0]].copy_(d["ckeys"])
+                sm_use = replace(sampling_metadata, temperature=d["ctemp"])
+            else:
+                sm_use = sampling_metadata
             static_cad = replace(
                 cad,
                 query_start_loc=d["qsl"],
@@ -10718,23 +10869,28 @@ class GPUModelRunner(
             spec_cad, token_indices, num_rejected = drafter.prepare_inputs_padded(
                 static_cad, spec, d["valid"]
             )
-            total = spec_cad.num_actual_tokens
-            hidden = torch.cat(
-                [d[f"aux{i}"][:total] for i in range(len(aux_hidden_states))],
-                dim=-1,
+            from vllm.models.deepseek_v41.propose_graph import (
+                bind_static_attn_metadata,
             )
-            return drafter.propose(
-                target_token_ids=self.input_ids.gpu[:total],
-                target_positions=self._get_positions(total),
-                target_hidden_states=hidden,
-                next_token_ids=d["next"],
-                token_indices_to_sample=token_indices,
-                sampling_metadata=sampling_metadata,
-                common_attn_metadata=spec_cad,
-                mm_embed_inputs=None,
-                num_rejected_tokens_gpu=num_rejected,
-                slot_mappings=slot_mappings,
-            )
+
+            with bind_static_attn_metadata(drafter, spec_cad):
+                total = spec_cad.num_actual_tokens
+                hidden = torch.cat(
+                    [d[f"aux{i}"][:total] for i in range(len(aux_hidden_states))],
+                    dim=-1,
+                )
+                return drafter.propose(
+                    target_token_ids=self.input_ids.gpu[:total],
+                    target_positions=self._get_positions(total),
+                    target_hidden_states=hidden,
+                    next_token_ids=d["next"],
+                    token_indices_to_sample=token_indices,
+                    sampling_metadata=sm_use,
+                    common_attn_metadata=spec_cad,
+                    mm_embed_inputs=None,
+                    num_rejected_tokens_gpu=num_rejected,
+                    slot_mappings=slot_mappings,
+                )
 
         if cad.max_query_len > self.num_spec_tokens + 1:
             # A prefill chunk in the step: its shape is new nearly every time
@@ -13452,29 +13608,15 @@ class GPUModelRunner(
                 num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                 if isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
-                    # Compressed MLA is split into physical pool pages instead
-                    # of the scheduler's attention-kernel blocks.
-                    if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
-                        # QSA side caches consume physical block tables; paged
-                        # MQA indexers consume smaller virtual pages. Match the
-                        # metadata builder and the V2 cache layout in each case.
-                        uses_physical_block_table = (
-                            attn_backend.get_builder_cls().uses_physical_block_table
-                        )
-                        shape_block_size = (
-                            kv_cache_spec.storage_block_size
-                            if uses_physical_block_table
-                            else compressed_kernel_block_size(kv_cache_spec)
-                        )
-                        kernel_num_blocks = num_blocks * (
-                            kv_cache_spec.storage_block_size // shape_block_size
-                        )
-                    else:
-                        num_blocks_per_kv_block = (
-                            kv_cache_spec.block_size // kernel_block_size
-                        )
-                        kernel_num_blocks = num_blocks * num_blocks_per_kv_block
-                        shape_block_size = kernel_block_size
+                    # Compressed caches are split into the view pages the
+                    # metadata builder and the KV block zeroer also derive
+                    # from kv_cache_view_page_rows.
+                    shape_block_size = kv_cache_view_page_rows(
+                        kv_cache_spec, kernel_block_size, attn_backend
+                    )
+                    kernel_num_blocks = num_blocks * (
+                        kv_cache_spec.storage_block_size // shape_block_size
+                    )
 
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
                         kernel_num_blocks,

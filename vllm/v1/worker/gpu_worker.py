@@ -676,8 +676,26 @@ class Worker(WorkerBase):
         decode_width = self.vllm_config.scheduler_config.max_num_seqs * (
             1 + (spec.num_speculative_tokens if spec is not None else 0)
         )
-        if max(compilation.cudagraph_capture_sizes or [0]) <= decode_width:
+        max_capture = max(compilation.cudagraph_capture_sizes or [0])
+        if max_capture <= decode_width:
             return 0
+        max_batched = max(
+            1, int(self.vllm_config.scheduler_config.max_num_batched_tokens)
+        )
+        if max_capture < max_batched:
+            scaled_peak = int(
+                activation_peak * min(1.0, (1.0 * max_capture) / max_batched)
+            )
+            logger.info(
+                "Reserving %.2f GiB (scaled from %.2f GiB activation peak for "
+                "max_capture=%d / max_batched=%d) for CUDA graph pools before "
+                "sizing the KV cache.",
+                scaled_peak / 2**30,
+                activation_peak / 2**30,
+                max_capture,
+                max_batched,
+            )
+            return max(0, scaled_peak)
         logger.info(
             "Reserving %.2f GiB (profiled activation peak) for prefill-size "
             "CUDA graph pools before sizing the KV cache.",
@@ -1185,6 +1203,8 @@ class Worker(WorkerBase):
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
 
+        self._warmup_multimodal_triton_kernels()
+
         # All warmup is done — start monitoring for unexpected JIT
         # compilations that would cause latency spikes during inference.
         from vllm.triton_utils.jit_monitor import (
@@ -1200,6 +1220,63 @@ class Worker(WorkerBase):
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
         )
+
+    def _warmup_multimodal_triton_kernels(self) -> None:
+        """Pre-compile multimodal encoder Triton kernels before JIT monitoring."""
+        if (
+            not self.model_config.is_multimodal_model
+            or self.device is None
+            or self.device.type != "cuda"
+        ):
+            return
+        try:
+            from vllm.model_executor.layers.rotary_embedding.common import (
+                ApplyRotaryEmb,
+            )
+        except Exception:
+            return
+        model = getattr(self.model_runner, "model", None)
+        if model is None or not hasattr(model, "modules"):
+            return
+        seen_specs: set[tuple[torch.dtype, int, int, bool, bool]] = set()
+        for module in model.modules():
+            rotary = getattr(module, "apply_rotary_emb", None)
+            if not isinstance(rotary, ApplyRotaryEmb):
+                continue
+            nheads = int(getattr(module, "num_attention_heads_per_partition", 0) or 4)
+            headdim = int(getattr(module, "hidden_size_per_attention_head", 0) or 64)
+            if headdim <= 0 or headdim % 2 != 0:
+                continue
+            spec = (
+                self.model_config.dtype,
+                nheads,
+                headdim,
+                bool(rotary.is_neox_style),
+                bool(rotary.enable_fp32_compute),
+            )
+            if spec in seen_specs:
+                continue
+            seen_specs.add(spec)
+            try:
+                dummy_x = torch.zeros(
+                    (2, 4, nheads, headdim),
+                    dtype=self.model_config.dtype,
+                    device=self.device,
+                )
+                dummy_cos = torch.ones(
+                    (4, headdim // 2),
+                    dtype=self.model_config.dtype,
+                    device=self.device,
+                )
+                dummy_sin = torch.zeros_like(dummy_cos)
+                rotary(dummy_x, dummy_cos, dummy_sin)
+                del dummy_x, dummy_cos, dummy_sin
+            except Exception:
+                logger.debug(
+                    "Skipping multimodal rotary Triton warmup for spec=%s",
+                    spec,
+                    exc_info=True,
+                )
 
     @staticmethod
     def _release_compile_artifact_records() -> int:
@@ -1648,6 +1725,19 @@ class Worker(WorkerBase):
                     value.numel() * value.element_size() <= (4 << 20)
                 ):
                     tensor_dict[key] = tp.all_reduce(value)
+                elif (
+                    key == "v41_topk"
+                    and value.dtype == torch.int32
+                    and value.numel() * 4 <= (4 << 20)
+                ):
+                    vf = (
+                        value.to(torch.float32)
+                        if tp.rank_in_group == 0
+                        else torch.zeros(
+                            value.shape, dtype=torch.float32, device=value.device
+                        )
+                    )
+                    value.copy_(tp.all_reduce(vf).to(torch.int32))
                 else:
                     tp.broadcast(value, src=0)
 

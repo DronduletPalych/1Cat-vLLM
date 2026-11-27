@@ -420,6 +420,7 @@ def _expand_qsa_indices_kernel(
     TOKEN_TOPK: tl.constexpr,
     OUTPUT_WIDTH: tl.constexpr,
     COLUMN_BLOCK: tl.constexpr,
+    FOLDED8: tl.constexpr = False,
 ) -> None:
     row = tl.program_id(0)
     columns = tl.program_id(1) * COLUMN_BLOCK + tl.arange(0, COLUMN_BLOCK)
@@ -446,8 +447,18 @@ def _expand_qsa_indices_kernel(
     block_rank = columns // COMPRESS_RATIO
     offset = columns % COMPRESS_RATIO
     safe_rank = tl.minimum(block_rank, BLOCK_TOPK - 1)
+    if FOLDED8:
+        h_step = rows >> 3
+        seg = row // h_step
+        seg_off = row - seg * h_step
+        folded_seg = tl.where(seg < 4, seg * 2, (7 - seg) * 2 + 1)
+        src_row = folded_seg * h_step + seg_off
+    else:
+        src_row = row
     block = tl.load(
-        block_indices_ptr + row * stride_blocks_row + safe_rank * stride_blocks_column,
+        block_indices_ptr
+        + src_row * stride_blocks_row
+        + safe_rank * stride_blocks_column,
         mask=(row < rows) & is_expanded,
         other=-1,
     )
@@ -1382,11 +1393,15 @@ def _use_sm70_qsa_indexer_cublas(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     page_table: torch.Tensor,
+    bounded_columns: int = 0,
 ) -> bool:
+    min_rows = sparse_policy().value("qsa_cublas_min_rows")
+    if bounded_columns >= 4096:
+        min_rows = min(min_rows, 128)
     return (
         sparse_policy().value("qsa_indexer_cublas")
         and current_platform.is_device_capability_family(70)
-        and q.shape[0] >= sparse_policy().value("qsa_cublas_min_rows")
+        and q.shape[0] >= min_rows
         and _qsa_indexer_cublas_shape_supported(q, k_cache, page_table)
     )
 
@@ -1526,6 +1541,8 @@ def expand_qsa_block_indices_cuda(
     compress_ratio: int,
     token_topk: int,
     out: torch.Tensor | None = None,
+    *,
+    folded8: bool = False,
 ) -> torch.Tensor:
     """Expand compressed blocks and compact the causal tail of the open group."""
 
@@ -1571,6 +1588,7 @@ def expand_qsa_block_indices_cuda(
         TOKEN_TOPK=token_topk,
         OUTPUT_WIDTH=output_width,
         COLUMN_BLOCK=column_block,
+        FOLDED8=bool(folded8),
         num_warps=4,
     )
     return out
@@ -1614,6 +1632,7 @@ def _qsa_select_by_request(
     shared_key_scoring: bool = False,
     max_seq_len: int | None = None,
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
+    tp_group=None,
 ) -> bool:
     """Select a multi-request batch one long request at a time.
 
@@ -1641,7 +1660,11 @@ def _qsa_select_by_request(
     if query_start_loc[0] != 0 or query_start_loc[-1] != rows:
         return False
     segments = _qsa_indexer_request_segments(
-        query_start_loc, sparse_policy().value("qsa_cublas_min_rows")
+        query_start_loc,
+        min(
+            sparse_policy().value("qsa_cublas_min_rows"),
+            128 if (max_seq_len or 0) >= 16384 else 512,
+        ),
     )
     if all(request is None for _, _, request in segments):
         return False
@@ -1695,6 +1718,7 @@ def _qsa_select_by_request(
                 out[start:end],
                 shared_key_scoring=shared_key_scoring,
                 max_seq_len=req_max_seq_len,
+                tp_group=tp_group,
             )
     return True
 
@@ -1714,6 +1738,7 @@ def qsa_select_paged_tokens(
     max_seq_len: int | None = None,
     tp_group=None,
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
+    q_already_folded8: bool = False,
 ) -> torch.Tensor:
     """Score, select, and expand QSA indices without host synchronization.
 
@@ -1722,7 +1747,7 @@ def qsa_select_paged_tokens(
     reading the device.
     """
 
-    rows = q.shape[0]
+    rows = q.shape[0] * 4 if q_already_folded8 else q.shape[0]
     output_width = token_topk + compress_ratio - 1
     if out is None:
         out = torch.empty((rows, output_width), dtype=torch.int32, device=q.device)
@@ -1730,20 +1755,25 @@ def qsa_select_paged_tokens(
         raise ValueError("QSA selection output has an invalid shape")
     if not rows:
         return out
-    if query_start_loc_cpu is not None and _qsa_select_by_request(
-        q,
-        k_cache,
-        page_table,
-        token_to_req,
-        query_positions,
-        sequence_lengths,
-        token_topk,
-        compress_ratio,
-        out,
-        query_start_loc_cpu,
-        shared_key_scoring=shared_key_scoring,
-        max_seq_len=max_seq_len,
-        seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+    if (
+        not q_already_folded8
+        and query_start_loc_cpu is not None
+        and _qsa_select_by_request(
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            token_topk,
+            compress_ratio,
+            out,
+            query_start_loc_cpu,
+            shared_key_scoring=shared_key_scoring,
+            max_seq_len=max_seq_len,
+            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            tp_group=tp_group,
+        )
     ):
         return out
 
@@ -1751,31 +1781,32 @@ def qsa_select_paged_tokens(
     block_topk = token_topk // compress_ratio
     bounded_columns = capacity_columns
     if max_seq_len is not None and not torch.cuda.is_current_stream_capturing():
-        live_bound = max(block_topk, max_seq_len // compress_ratio)
+        live_bound = max(block_topk, triton.cdiv(max_seq_len, compress_ratio))
         bounded_columns = min(capacity_columns, triton.cdiv(live_bound, 4) * 4)
     score_columns = bounded_columns
     contiguous_keys: torch.Tensor | None = None
     key_valid: torch.Tensor | None = None
     all_visible: torch.Tensor | None = None
-    if _use_sm70_qsa_indexer_cublas(q, k_cache, page_table):
+    if _use_sm70_qsa_indexer_cublas(q, k_cache, page_table, bounded_columns):
         all_visible = _qsa_visible_blocks(
-            token_to_req,
-            query_positions,
+            token_to_req[:rows],
+            query_positions[:rows],
             sequence_lengths,
             compress_ratio,
         )
         # cuBLAS has a rectangular host-side launch shape, unlike the paged
         # Triton kernel's device-side early exit. Bound it to this chunk's live
         # prefix so early-context prefill does not multiply the unused 140K
-        # model-capacity tail. Visible blocks never exceed seq_len // ratio,
-        # so the host bound needs no sync; columns past a row's visible
-        # blocks are ignored by the top-k. Without it, one scalar sync.
+        # model-capacity tail. Round up to 4 columns so FP32 logits rows stay
+        # 16-byte float4-aligned for SM70 lexicographic top-k at odd lengths.
         live_blocks = (
-            max_seq_len // compress_ratio
+            triton.cdiv(max_seq_len, compress_ratio)
             if max_seq_len is not None
             else int(all_visible.max().item())
         )
-        cublas_columns = min(capacity_columns, max(block_topk, live_blocks))
+        cublas_columns = min(
+            capacity_columns, triton.cdiv(max(block_topk, live_blocks), 4) * 4
+        )
         if _qsa_indexer_cublas_work_supported(rows, cublas_columns):
             score_columns = cublas_columns
             logger.info_once(
@@ -1797,10 +1828,11 @@ def qsa_select_paged_tokens(
     # Keep small work, mixed requests, other topologies and graph capture on
     # the existing selector. Cache writes have already completed on every rank.
     tp_step = 0
+    tp_folded8 = False
     if (
         tp_group is not None
         and tp_group.world_size == 4
-        and 4096 <= rows <= 9216
+        and 320 <= rows <= 16384
         and q.shape[1:] == (4, 128)
         and token_topk == 2048
         and compress_ratio == 4
@@ -1809,16 +1841,33 @@ def qsa_select_paged_tokens(
     ):
         step = triton.cdiv(rows, tp_group.world_size)
         smallest_partition = rows - (tp_group.world_size - 1) * step
-        if smallest_partition >= sparse_policy().value(
-            "qsa_cublas_min_rows"
-        ) and _qsa_indexer_cublas_work_supported(smallest_partition, score_columns):
+        tp_min_rows = (
+            80
+            if score_columns >= 4096
+            else min(256, sparse_policy().value("qsa_cublas_min_rows"))
+        )
+        if smallest_partition >= tp_min_rows and (
+            _qsa_indexer_cublas_work_supported(smallest_partition, score_columns)
+            or (score_columns >= 4096 and smallest_partition * score_columns >= 524288)
+        ):
             tp_step = step
-            first = tp_group.rank_in_group * step
-            last = min(first + step, rows)
-            q = q[first:last]
             assert all_visible is not None
-            all_visible = all_visible[first:last]
-            rows = last - first
+            if (rows & 7) == 0 and rows >= 2048:
+                tp_folded8 = True
+                h_step = rows >> 3
+                rk = tp_group.rank_in_group
+                s0 = slice(rk * h_step, (rk + 1) * h_step)
+                s1 = slice((7 - rk) * h_step, (8 - rk) * h_step)
+                if not q_already_folded8:
+                    q = torch.cat((q[s0], q[s1]), dim=0)
+                all_visible = torch.cat((all_visible[s0], all_visible[s1]), dim=0)
+                rows = 2 * h_step
+            else:
+                first = tp_group.rank_in_group * step
+                last = min(first + step, rows)
+                q = q[first:last]
+                all_visible = all_visible[first:last]
+                rows = last - first
             logger.info_once(
                 "Using SM70 QSA TP4 prefill row partition with block-index AllGather."
             )
@@ -1955,15 +2004,32 @@ def qsa_select_paged_tokens(
         # Gather the compressed block IDs, not the four-times wider expanded
         # token matrix. Padding is confined to the last rank and discarded.
         blocks_buffer[rows:].fill_(-1)
-        gathered = tp_group.all_gather(blocks_buffer, dim=0)
+        from vllm.runtime_resources import current_runtime_resources
+
+        resources = current_runtime_resources()
+        peer_owner = resources.get("hc_prefill_peer") if resources is not None else None
+        if (
+            peer_owner is not None
+            and peer_owner.group is tp_group
+            and peer_owner.can_allgather_ag(blocks_buffer)
+        ):
+            gathered_blocks = torch.empty(
+                (out.shape[0], block_topk),
+                dtype=torch.int32,
+                device=blocks_buffer.device,
+            )
+            peer_owner.allgather_ag_into(gathered_blocks, blocks_buffer)
+        else:
+            gathered_blocks = tp_group.all_gather(blocks_buffer, dim=0)[: out.shape[0]]
         expand_qsa_block_indices_cuda(
-            gathered[: out.shape[0]],
+            gathered_blocks,
             query_positions,
             sequence_lengths,
             token_to_req,
             compress_ratio,
             token_topk,
             out,
+            folded8=tp_folded8,
         )
     return out
 
